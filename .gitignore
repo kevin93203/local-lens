@@ -1,0 +1,20 @@
+# JavaScript dependencies and builds
+node_modules/
+dist/
+.npm-cache/
+
+# Rust / Tauri builds
+src-tauri/target/
+
+# Local working files and user-facing exports
+work/
+outputs/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
