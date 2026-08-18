@@ -1,5 +1,7 @@
 use std::{
     ffi::OsString,
+    fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -7,7 +9,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageFormat};
 use serde::Serialize;
 use tauri::{Emitter, State};
 use walkdir::WalkDir;
@@ -97,25 +99,128 @@ fn has_tesseract(program: &OsString) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_ocr_text(path: &Path, program: &OsString) -> String {
-    fn run(path: &Path, program: &OsString, language: OsString) -> Option<String> {
-        let output = Command::new(program)
-            .arg(path)
-            .arg("stdout")
-            .arg("--psm")
-            .arg("6")
-            .arg("-l")
-            .arg(language)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+struct OcrCandidate {
+    text: String,
+    confidence: f32,
+}
+
+fn make_ocr_image(path: &Path) -> Option<PathBuf> {
+    let source = image::open(path).ok()?;
+    let largest_side = source.width().max(source.height());
+    let target_side = if largest_side < 1800 {
+        (largest_side.saturating_mul(2)).min(2600)
+    } else {
+        largest_side.min(3200)
+    };
+    let resized = if target_side != largest_side {
+        source.resize(target_side, target_side, FilterType::Lanczos3)
+    } else {
+        source
+    };
+    let enhanced = resized.grayscale().adjust_contrast(18.0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    let output = std::env::temp_dir().join(format!(
+        "local-lens-ocr-{}-{:x}.png",
+        std::process::id(),
+        hasher.finish()
+    ));
+    enhanced.save_with_format(&output, ImageFormat::Png).ok()?;
+    Some(output)
+}
+
+fn run_tesseract(
+    path: &Path,
+    program: &OsString,
+    language: &OsString,
+    page_segmentation_mode: u8,
+) -> Option<OcrCandidate> {
+    let output = Command::new(program)
+        .arg(path)
+        .arg("stdout")
+        .arg("--oem")
+        .arg("1")
+        .arg("--psm")
+        .arg(page_segmentation_mode.to_string())
+        .arg("-l")
+        .arg(language)
+        .arg("-c")
+        .arg("user_defined_dpi=300")
+        .arg("-c")
+        .arg("preserve_interword_spaces=1")
+        .arg("tsv")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
 
-    run(path, program, tesseract_language())
-        .or_else(|| run(path, program, OsString::from("eng")))
+    let mut words = Vec::new();
+    let mut confidence_total = 0.0;
+    let mut confidence_count = 0;
+    for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
+        let fields: Vec<&str> = line.splitn(12, '\t').collect();
+        if fields.len() < 12 {
+            continue;
+        }
+        let word = fields[11].trim();
+        if word.is_empty() {
+            continue;
+        }
+        if let Ok(confidence) = fields[10].parse::<f32>() {
+            if confidence >= 0.0 {
+                confidence_total += confidence;
+                confidence_count += 1;
+            }
+        }
+        words.push(word.to_owned());
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let confidence = if confidence_count == 0 {
+        0.0
+    } else {
+        confidence_total / confidence_count as f32
+    };
+    // Low-confidence OCR is usually visual noise. Do not put it into the
+    // search index where it would create false-positive matches.
+    if confidence_count > 0 && confidence < 20.0 {
+        return None;
+    }
+    Some(OcrCandidate {
+        text: words.join(" "),
+        confidence,
+    })
+}
+
+fn extract_ocr_text(path: &Path, program: &OsString) -> String {
+    let enhanced_path = make_ocr_image(path);
+    let enhanced = enhanced_path.as_deref().unwrap_or(path);
+    let configured_language = tesseract_language();
+    let english = OsString::from("eng");
+    let mut candidates = Vec::new();
+    for (input, mode) in [(enhanced, 6_u8), (path, 11_u8)] {
+        if let Some(candidate) = run_tesseract(input, program, &configured_language, mode) {
+            candidates.push(candidate);
+        } else if configured_language != english {
+            if let Some(candidate) = run_tesseract(input, program, &english, mode) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    if let Some(temp_path) = enhanced_path {
+        let _ = fs::remove_file(temp_path);
+    }
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            let left_score = left.confidence + (left.text.chars().count().min(200) as f32 * 0.08);
+            let right_score =
+                right.confidence + (right.text.chars().count().min(200) as f32 * 0.08);
+            left_score.total_cmp(&right_score)
+        })
+        .map(|candidate| candidate.text)
         .unwrap_or_default()
 }
 
@@ -243,9 +348,21 @@ fn search_images(query: String, index: State<'_, AppIndex>) -> Result<Vec<ImageR
                 record.people.join(" ")
             )
             .to_lowercase();
+            let compact_haystack: String = haystack
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
             let matched = terms
                 .iter()
-                .filter(|term| haystack.contains(term.as_str()))
+                .filter(|term| {
+                    haystack.contains(term.as_str())
+                        || compact_haystack.contains(
+                            &term
+                                .chars()
+                                .filter(|character| !character.is_whitespace())
+                                .collect::<String>(),
+                        )
+                })
                 .count();
             (terms.is_empty() || matched > 0).then(|| {
                 let mut copy = record.clone();

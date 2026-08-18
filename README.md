@@ -41,6 +41,8 @@ npm run tauri dev
 
 若未安裝 Tesseract，應用程式仍可建立圖片索引，但會顯示「OCR 未啟用」，並只用檔名搜尋。
 
+若照片主要是繁體中文，可將語言設為 `chi_tra`；中英混合才使用 `eng+chi_tra`。語言資料不完整時，Tesseract 很容易產生亂碼或低信心結果。
+
 建置 Windows 安裝檔：
 
 ```powershell
