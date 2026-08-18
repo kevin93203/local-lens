@@ -1,5 +1,7 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::SystemTime,
 };
@@ -23,7 +25,7 @@ struct ImageRecord {
     width: Option<u32>,
     height: Option<u32>,
     thumbnail: String,
-    // Reserved for the OCR and face-recognition pipeline.
+    // OCR text is kept alongside the image record for local text search.
     ocr_text: String,
     people: Vec<String>,
     score: f32,
@@ -37,6 +39,7 @@ struct ScanResult {
     root: String,
     indexed: usize,
     skipped: usize,
+    ocr_available: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -45,6 +48,7 @@ struct ScanProgress {
     total: usize,
     indexed: usize,
     skipped: usize,
+    ocr_available: bool,
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -75,6 +79,46 @@ fn format_modified(time: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+fn tesseract_program() -> OsString {
+    std::env::var_os("LOCAL_LENS_TESSERACT").unwrap_or_else(|| OsString::from("tesseract"))
+}
+
+fn tesseract_language() -> OsString {
+    std::env::var_os("LOCAL_LENS_TESSERACT_LANG").unwrap_or_else(|| OsString::from("eng+chi_tra"))
+}
+
+fn has_tesseract(program: &OsString) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn extract_ocr_text(path: &Path, program: &OsString) -> String {
+    fn run(path: &Path, program: &OsString, language: OsString) -> Option<String> {
+        let output = Command::new(program)
+            .arg(path)
+            .arg("stdout")
+            .arg("--psm")
+            .arg("6")
+            .arg("-l")
+            .arg(language)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    run(path, program, tesseract_language())
+        .or_else(|| run(path, program, OsString::from("eng")))
+        .unwrap_or_default()
+}
+
 fn build_index(
     folder: String,
     app: tauri::AppHandle,
@@ -96,6 +140,8 @@ fn build_index(
     let total = candidates.len();
     let mut records = Vec::new();
     let mut skipped = 0;
+    let ocr_program = tesseract_program();
+    let ocr_available = has_tesseract(&ocr_program);
     app.emit(
         "scan-progress",
         ScanProgress {
@@ -103,6 +149,7 @@ fn build_index(
             total,
             indexed: 0,
             skipped: 0,
+            ocr_available,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -126,7 +173,11 @@ fn build_index(
                     width: Some(width),
                     height: Some(height),
                     thumbnail,
-                    ocr_text: String::new(),
+                    ocr_text: if ocr_available {
+                        extract_ocr_text(path, &ocr_program)
+                    } else {
+                        String::new()
+                    },
                     people: vec![],
                     score: 1.0,
                 });
@@ -143,6 +194,7 @@ fn build_index(
                     total,
                     indexed: records.len(),
                     skipped,
+                    ocr_available,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -155,6 +207,7 @@ fn build_index(
         root: folder,
         indexed,
         skipped,
+        ocr_available,
     })
 }
 

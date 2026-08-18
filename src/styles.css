@@ -36,6 +36,7 @@ form button { padding: 10px 16px; }
 .card-info strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .86rem; }
 .card-info span, .card-info small { color: #91a095; font-size: .72rem; }
 .card-info small { color: #c7f36b; }
+.card-info .ocr-text { color: #b8c4ba; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .empty { margin: 76px auto; text-align: center; color: #99a69b; max-width: 420px; }
 .empty div { color: #c7f36b; font-size: 3rem; }.empty h2 { color: #e6ece6; margin-bottom: 7px; }.empty p { margin: 0; line-height: 1.6; }
 footer { color: #66756a; font-size: .76rem; margin-top: 48px; text-align: center; }

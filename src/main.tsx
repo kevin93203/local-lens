@@ -19,8 +19,8 @@ type ImageRecord = {
   score: number;
 };
 
-type ScanResult = { root: string; indexed: number; skipped: number };
-type ScanProgress = { processed: number; total: number; indexed: number; skipped: number };
+type ScanResult = { root: string; indexed: number; skipped: number; ocr_available: boolean };
+type ScanProgress = { processed: number; total: number; indexed: number; skipped: number; ocr_available: boolean };
 
 function App() {
   const [query, setQuery] = useState("");
@@ -47,7 +47,7 @@ function App() {
     const selected = await open({ directory: true, multiple: false, title: "選擇照片資料夾" });
     if (!selected || Array.isArray(selected)) return;
     setBusy(true);
-    setScanProgress({ processed: 0, total: 0, indexed: 0, skipped: 0 });
+    setScanProgress({ processed: 0, total: 0, indexed: 0, skipped: 0, ocr_available: false });
     setStatus("正在產生縮圖與建立索引…");
     try {
       const result = await invoke<ScanResult>("scan_folder", { folder: selected });
@@ -55,7 +55,7 @@ function App() {
       setQuery("");
       const indexed = await invoke<ImageRecord[]>("search_images", { query: "" });
       setImages(indexed);
-      setStatus(`已索引 ${result.indexed} 張圖片，先載入最多 200 張預覽${result.skipped ? `；略過 ${result.skipped} 個無法讀取的檔案` : ""}。`);
+      setStatus(`已索引 ${result.indexed} 張圖片，先載入最多 200 張預覽；${result.ocr_available ? "OCR 已啟用" : "找不到 Tesseract，僅使用檔名搜尋"}${result.skipped ? `；略過 ${result.skipped} 個無法讀取的檔案` : ""}。`);
     } catch (error) {
       setStatus(`建立索引失敗：${String(error)}`);
     } finally {
@@ -117,7 +117,7 @@ function App() {
           <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={scanProgress.total || undefined} aria-valuenow={scanProgress.processed}>
             <div className="progress-fill" style={{ width: scanProgress.total ? `${Math.round((scanProgress.processed / scanProgress.total) * 100)}%` : "3%" }} />
           </div>
-          <p>已建立 {scanProgress.indexed} 張縮圖{scanProgress.skipped ? `，略過 ${scanProgress.skipped} 個無法讀取的檔案` : ""}。</p>
+          <p>已建立 {scanProgress.indexed} 張縮圖；{scanProgress.ocr_available ? "同步進行 OCR" : "OCR 未啟用"}{scanProgress.skipped ? `；略過 ${scanProgress.skipped} 個無法讀取的檔案` : ""}。</p>
         </section>
       )}
 
@@ -139,6 +139,7 @@ function App() {
                   <strong>{image.filename}</strong>
                   <span>{image.width && image.height ? `${image.width} × ${image.height}` : "圖片"}</span>
                   {image.people.length > 0 && <small>{image.people.join("、")}</small>}
+                  {image.ocr_text && <small className="ocr-text" title={image.ocr_text}>OCR：{image.ocr_text.slice(0, 100)}</small>}
                 </div>
               </article>
             ))}
