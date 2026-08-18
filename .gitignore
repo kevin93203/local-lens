@@ -18,3 +18,6 @@ outputs/
 Thumbs.db
 .idea/
 .vscode/
+
+# Temporary clone used while preparing the vendored FastEmbed source
+vendor/fastembed/

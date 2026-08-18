@@ -78,6 +78,8 @@ npm run tauri dev
 
 按右上角「設定」可分別啟用 CLIP、Face 與 OCR 的 GPU 選項。CLIP 與 Face 在 Windows 使用 ONNX Runtime DirectML，可支援具備 DirectX 12 的 NVIDIA、AMD 與 Intel GPU；若 DirectML 無法註冊或模型工作階段無法建立，應用程式會自動退回 CPU，並在建立索引進度與完成訊息顯示實際後端。設定保存在 app-data 的 `settings.json`，變更後需要重新選擇照片資料夾以重建索引。
 
+專案內的 `vendor/fastembed-patched` 是 FastEmbed 4.9.1 的可重現副本，額外為 DirectML 工作階段關閉 ONNX Runtime 不支援的 memory pattern 與平行執行設定；這能避免勾選 GPU 後模型初始化失敗卻靜默退回 CPU。
+
 OCR 仍使用外部 Tesseract。勾選「OCR OpenCL（實驗性）」會為 Tesseract 子程序設定 `TESSERACT_OPENCL_DEVICE=1`，但只有自行編譯且啟用 OpenCL 的 Tesseract 才會使用 GPU；官方不建議一般使用者依賴這項實驗性功能，而且它不一定比 CPU 快。標準 Windows 安裝版通常仍會使用 CPU。
 
 - [ONNX Runtime DirectML 說明](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html)

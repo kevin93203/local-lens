@@ -141,6 +141,7 @@ struct ScanResult {
     clip_gpu_active: bool,
     face_gpu_active: bool,
     ocr_gpu_requested: bool,
+    gpu_warning: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -156,6 +157,7 @@ struct ScanProgress {
     clip_gpu_active: bool,
     face_gpu_active: bool,
     ocr_gpu_requested: bool,
+    gpu_warning: Option<String>,
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -204,26 +206,25 @@ fn directml_available() -> bool {
     })
 }
 
-fn load_image_embedding(use_gpu: bool) -> (Option<ImageEmbedding>, bool) {
+fn load_image_embedding(use_gpu: bool) -> (Option<ImageEmbedding>, bool, Option<String>) {
+    let mut gpu_error = None;
     if use_gpu {
         let options = ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32)
             .with_execution_providers(clip_execution_providers(true))
             .with_show_download_progress(false);
-        if let Ok(model) = ImageEmbedding::try_new(options) {
-            return (Some(model), true);
+        match ImageEmbedding::try_new(options) {
+            Ok(model) => return (Some(model), true, None),
+            Err(error) => gpu_error = Some(format!("CLIP GPU 初始化失敗：{error}")),
         }
     }
-    (
-        ImageEmbedding::try_new(
-            ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32)
-                .with_show_download_progress(false),
-        )
-        .ok(),
-        false,
+    let cpu_model = ImageEmbedding::try_new(
+        ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32).with_show_download_progress(false),
     )
+    .ok();
+    (cpu_model, false, gpu_error)
 }
 
-fn load_face_engine(use_gpu: bool) -> Result<(FaceEngine, bool), String> {
+fn load_face_engine(use_gpu: bool) -> Result<(FaceEngine, bool, Option<String>), String> {
     let detector_override = std::env::var_os("LOCAL_LENS_FACE_DETECTOR").map(PathBuf::from);
     let recognizer_override = std::env::var_os("LOCAL_LENS_FACE_RECOGNIZER").map(PathBuf::from);
     let (detector_path, recognizer_path) = match (detector_override, recognizer_override) {
@@ -249,13 +250,15 @@ fn load_face_engine(use_gpu: bool) -> Result<(FaceEngine, bool), String> {
             (detector, recognizer)
         }
     };
+    let mut gpu_error = None;
     if use_gpu {
-        if let Ok(engine) = FaceEngine::new(&detector_path, &recognizer_path, true) {
-            return Ok((engine, true));
+        match FaceEngine::new(&detector_path, &recognizer_path, true) {
+            Ok(engine) => return Ok((engine, true, None)),
+            Err(error) => gpu_error = Some(format!("Face GPU 初始化失敗：{error}")),
         }
     }
     FaceEngine::new(detector_path, recognizer_path, false)
-        .map(|engine| (engine, false))
+        .map(|engine| (engine, false, gpu_error))
         .map_err(|error| format!("無法載入人臉模型：{error}"))
 }
 
@@ -617,14 +620,30 @@ fn build_index(
     // The first initialization may download the local ONNX models into the
     // FastEmbed cache. It runs inside the blocking worker, never on the UI loop.
     let gpu_available = directml_available();
-    let (mut image_model, clip_gpu_active) =
+    let mut gpu_warnings = Vec::new();
+    if !gpu_available {
+        if settings.clip_gpu {
+            gpu_warnings.push("CLIP GPU：找不到可用的 DirectML，已使用 CPU".to_owned());
+        }
+        if settings.face_gpu {
+            gpu_warnings.push("Face GPU：找不到可用的 DirectML，已使用 CPU".to_owned());
+        }
+    }
+    let (mut image_model, clip_gpu_active, clip_gpu_error) =
         load_image_embedding(settings.clip_gpu && gpu_available);
+    if let Some(error) = clip_gpu_error {
+        gpu_warnings.push(error);
+    }
     let mut semantic_available = image_model.is_some();
-    let (mut face_engine, face_gpu_active) =
+    let (mut face_engine, face_gpu_active, face_gpu_error) =
         match load_face_engine(settings.face_gpu && gpu_available) {
-            Ok((engine, active)) => (Some(engine), active),
-            Err(_) => (None, false),
+            Ok((engine, active, error)) => (Some(engine), active, error),
+            Err(error) => (None, false, Some(error)),
         };
+    if let Some(error) = face_gpu_error {
+        gpu_warnings.push(error);
+    }
+    let gpu_warning = (!gpu_warnings.is_empty()).then(|| gpu_warnings.join("；"));
     let face_available = face_engine.is_some();
     app.emit(
         "scan-progress",
@@ -640,6 +659,7 @@ fn build_index(
             clip_gpu_active,
             face_gpu_active,
             ocr_gpu_requested: settings.ocr_gpu,
+            gpu_warning: gpu_warning.clone(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -741,6 +761,7 @@ fn build_index(
                     clip_gpu_active,
                     face_gpu_active,
                     ocr_gpu_requested: settings.ocr_gpu,
+                    gpu_warning: gpu_warning.clone(),
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -765,6 +786,7 @@ fn build_index(
         clip_gpu_active,
         face_gpu_active,
         ocr_gpu_requested: settings.ocr_gpu,
+        gpu_warning,
     })
 }
 
