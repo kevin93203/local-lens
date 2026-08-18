@@ -70,7 +70,11 @@ function App() {
     try {
       const result = await invoke<ImageRecord[]>("search_images", { query: nextQuery });
       setImages(result);
-      setStatus(nextQuery.trim() ? `顯示最多 200 張相符圖片（目前 ${result.length} 張）。` : `顯示最多 200 張已索引圖片（目前 ${result.length} 張）。`);
+      setStatus(nextQuery.trim()
+        ? result.length > 0
+          ? `顯示 ${result.length} 張高相關圖片（最多 60 張）。`
+          : "找不到高信心結果，請改用更具體的描述；目前語意模型以英文查詢較準確。"
+        : `顯示最多 200 張已索引圖片（目前 ${result.length} 張）。`);
     } catch (error) {
       setStatus(`搜尋失敗：${String(error)}`);
     } finally {

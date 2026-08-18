@@ -20,7 +20,10 @@ use walkdir::WalkDir;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const MAX_INDEXED_IMAGES: usize = 3_000;
-const MAX_SEARCH_RESULTS: usize = 200;
+const MAX_BROWSE_RESULTS: usize = 200;
+const MAX_SEARCH_RESULTS: usize = 60;
+const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
+const SEMANTIC_BEST_MARGIN: f32 = 0.07;
 
 // Keep the text encoder alive after its first use. Loading the ONNX session
 // for every keystroke/search would make subsequent searches unnecessarily slow.
@@ -387,39 +390,70 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     }
 }
 
-fn embed_query(query: &str) -> Option<Vec<f32>> {
+fn embed_queries(query: &str) -> Vec<Vec<f32>> {
     let model_lock = TEXT_MODEL.get_or_init(|| Mutex::new(None));
-    let mut model = model_lock.lock().ok()?;
+    let Ok(mut model) = model_lock.lock() else {
+        return Vec::new();
+    };
     if model.is_none() {
         *model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::ClipVitB32).with_show_download_progress(false),
         )
         .ok();
     }
+    let Some(model) = model.as_ref() else {
+        return Vec::new();
+    };
+    // CLIP was trained with short image captions. Comparing both the user's
+    // original wording and a photo-oriented prompt is more stable for natural
+    // language queries than relying on only one phrasing.
     model
-        .as_ref()?
-        .embed(vec![query.to_owned()], None)
-        .ok()?
-        .pop()
+        .embed(
+            vec![query.to_owned(), format!("a photo of {query}")],
+            Some(2),
+        )
+        .unwrap_or_default()
+}
+
+fn semantic_threshold(best_score: Option<f32>) -> f32 {
+    best_score
+        .map(|score| (score - SEMANTIC_BEST_MARGIN).max(MIN_SEMANTIC_SIMILARITY))
+        .unwrap_or(MIN_SEMANTIC_SIMILARITY)
 }
 
 fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>, String> {
-    let terms: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
+    let normalized_query = query.to_lowercase();
+    let terms: Vec<String> = normalized_query
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '的' | '和' | '與' | '在' | '有' | '、' | '，' | ','
+                )
+        })
+        .filter(|term| !term.is_empty())
         .map(str::to_owned)
         .collect();
     let records = index.0.lock().map_err(|_| "索引暫時無法使用。")?;
-    let query_embedding =
-        if !query.trim().is_empty() && records.iter().any(|record| record.embedding.is_some()) {
-            embed_query(&query)
-        } else {
-            None
-        };
-    let semantic_search = query_embedding.is_some();
-    let mut matches: Vec<ImageRecord> = records
+    if query.trim().is_empty() {
+        return Ok(records.iter().take(MAX_BROWSE_RESULTS).cloned().collect());
+    }
+    let query_embeddings = if records.iter().any(|record| record.embedding.is_some()) {
+        embed_queries(&query)
+    } else {
+        Vec::new()
+    };
+    let semantic_search = !query_embeddings.is_empty();
+
+    struct SearchCandidate {
+        record: ImageRecord,
+        lexical_score: f32,
+        semantic_score: Option<f32>,
+    }
+
+    let candidates: Vec<SearchCandidate> = records
         .iter()
-        .filter_map(|record| {
+        .map(|record| {
             let haystack = format!(
                 "{} {} {}",
                 record.filename,
@@ -448,27 +482,44 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
             } else {
                 matched as f32 / terms.len() as f32
             };
-            let semantic_score = query_embedding
-                .as_ref()
-                .zip(record.embedding.as_ref())
-                .map(|(query_vector, image_vector)| {
-                    // Map cosine [-1, 1] to [0, 1] for blending with lexical score.
-                    (cosine_similarity(query_vector, image_vector) + 1.0) / 2.0
-                })
-                .unwrap_or(0.0);
-            (terms.is_empty() || matched > 0 || record.embedding.is_some() && semantic_search).then(
-                || {
-                    let mut copy = record.clone();
-                    copy.score = if semantic_search {
-                        semantic_score * 0.85 + lexical_score * 0.15
-                    } else if terms.is_empty() {
-                        1.0
-                    } else {
-                        lexical_score
-                    };
-                    copy
-                },
-            )
+            let semantic_score = record.embedding.as_ref().and_then(|image_vector| {
+                query_embeddings
+                    .iter()
+                    .map(|query_vector| cosine_similarity(query_vector, image_vector))
+                    .max_by(f32::total_cmp)
+            });
+            SearchCandidate {
+                record: record.clone(),
+                lexical_score,
+                semantic_score,
+            }
+        })
+        .collect();
+
+    let best_semantic_score = candidates
+        .iter()
+        .filter_map(|candidate| candidate.semantic_score)
+        .max_by(f32::total_cmp);
+    let threshold = semantic_threshold(best_semantic_score);
+    let mut matches: Vec<ImageRecord> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let semantic_match = semantic_search
+                && candidate
+                    .semantic_score
+                    .is_some_and(|score| score >= threshold);
+            (candidate.lexical_score > 0.0 || semantic_match).then(|| {
+                let mut record = candidate.record;
+                // Lexical/OCR hits are explicit evidence and should rank above a merely
+                // similar-looking image. Pure semantic matches keep their raw cosine score.
+                record.score = if candidate.lexical_score > 0.0 {
+                    1.0 + candidate.lexical_score
+                        + candidate.semantic_score.unwrap_or(0.0).max(0.0) * 0.15
+                } else {
+                    candidate.semantic_score.unwrap_or(0.0)
+                };
+                record
+            })
         })
         .collect();
     matches.sort_by(|a, b| {
@@ -476,8 +527,8 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
             .total_cmp(&a.score)
             .then_with(|| a.filename.cmp(&b.filename))
     });
-    // Thumbnails are data URLs. Keep the IPC response bounded, otherwise the
-    // renderer can freeze while receiving thousands of images at once.
+    // Semantic search intentionally returns a compact high-confidence set.
+    // Thumbnails are data URLs, so this also keeps the IPC response small.
     matches.truncate(MAX_SEARCH_RESULTS);
     Ok(matches)
 }
@@ -493,6 +544,30 @@ async fn search_images(
     tauri::async_runtime::spawn_blocking(move || search_images_sync(query, index))
         .await
         .map_err(|error| format!("搜尋工作意外中止：{error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn cosine_similarity_keeps_the_original_scale() {
+        assert_close(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]), 1.0);
+        assert_close(cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]), -1.0);
+        assert_close(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn semantic_threshold_rejects_low_confidence_results() {
+        assert_close(semantic_threshold(Some(0.33)), 0.26);
+        assert_close(semantic_threshold(Some(0.24)), 0.20);
+        assert_close(semantic_threshold(Some(0.18)), 0.20);
+        assert_close(semantic_threshold(None), 0.20);
+    }
 }
 
 pub fn run() {
