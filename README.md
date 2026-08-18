@@ -8,6 +8,7 @@
 - 在 Rust 背景端產生縮圖，避免結果頁直接讀取全尺寸照片
 - 依檔名搜尋，支援多個關鍵字的結果排序
 - 若系統可找到 Tesseract，建立索引時會抽取 OCR 文字並納入搜尋
+- 若 FastEmbed 模型可用，建立索引時會產生 CLIP 圖片向量，支援自然語言語意搜尋
 - 格狀預覽、圖片尺寸與雙擊於檔案總管開啟原圖
 - 預留 `ocr_text`、`people`、`score` 欄位，讓 OCR、人臉辨識及語意搜尋共用同一個索引介面
 - Tauri capability 僅開啟對話框與開啟檔案功能；掃描在 Rust 命令端執行
@@ -53,7 +54,20 @@ npm run tauri build
 
 1. 增加 SQLite：保存路徑、檔案修改時間、縮圖快取與索引版本，讓重新開啟應用後不用重掃。
 2. 將目前記憶體內的 OCR 結果移入 SQLite，並加上 SQLite FTS5 文字索引。
-3. ONNX Runtime worker：產生多語言圖片／文字 embedding，改由向量相似度處理自然語言搜尋。
+3. 將目前記憶體內的圖片向量移入 SQLite／sqlite-vec，避免重新掃描時重建模型向量。
 4. 人臉偵測、特徵向量與「待確認的人臉」畫面；僅在使用者確認後才把臉標記為姓名。
+
+## Semantic Search
+
+Semantic Search 使用 FastEmbed 的配對 CLIP vision/text ONNX 模型。第一次建立索引（圖片模型）或第一次搜尋（文字模型）時會下載模型並快取；若下載失敗，索引仍會完成，但會退回檔名與 OCR 文字搜尋。此配對模型主要以英文文字訓練，英文描述通常比繁體中文查詢準確；中文 OCR／檔名搜尋仍可正常使用。
+
+應用程式會把模型快取放到目前平台的 app-data `models` 資料夾；若要自行指定位置，可在啟動前設定：
+
+```powershell
+$env:FASTEMBED_CACHE_DIR = "$env:LOCALAPPDATA\LocalLens\models"
+npm run tauri dev
+```
+
+建立索引與第一次搜尋都在 Rust 背景工作執行，模型下載或載入時視窗仍可回應；首次使用需要網路，之後可離線使用已快取的模型。
 
 注意：人臉向量屬敏感資料。正式版應提供清除人物資料、重新建立索引、關閉人臉功能，並在使用前明確告知使用者。

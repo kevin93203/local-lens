@@ -4,19 +4,27 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::SystemTime,
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use fastembed::{
+    EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions,
+    TextEmbedding,
+};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageFormat};
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const MAX_INDEXED_IMAGES: usize = 3_000;
 const MAX_SEARCH_RESULTS: usize = 200;
+
+// Keep the text encoder alive after its first use. Loading the ONNX session
+// for every keystroke/search would make subsequent searches unnecessarily slow.
+static TEXT_MODEL: OnceLock<Mutex<Option<TextEmbedding>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 struct ImageRecord {
@@ -31,6 +39,8 @@ struct ImageRecord {
     ocr_text: String,
     people: Vec<String>,
     score: f32,
+    #[serde(skip)]
+    embedding: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Default)]
@@ -42,6 +52,7 @@ struct ScanResult {
     indexed: usize,
     skipped: usize,
     ocr_available: bool,
+    semantic_available: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -51,6 +62,7 @@ struct ScanProgress {
     indexed: usize,
     skipped: usize,
     ocr_available: bool,
+    semantic_available: bool,
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -247,6 +259,13 @@ fn build_index(
     let mut skipped = 0;
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
+    // The first initialization may download the local ONNX models into the
+    // FastEmbed cache. It runs inside the blocking worker, never on the UI loop.
+    let mut image_model = ImageEmbedding::try_new(
+        ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32).with_show_download_progress(false),
+    )
+    .ok();
+    let mut semantic_available = image_model.is_some();
     app.emit(
         "scan-progress",
         ScanProgress {
@@ -255,6 +274,7 @@ fn build_index(
             indexed: 0,
             skipped: 0,
             ocr_available,
+            semantic_available,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -262,6 +282,21 @@ fn build_index(
         match make_thumbnail(path) {
             Ok((thumbnail, width, height)) => {
                 let path_text = path.to_string_lossy().into_owned();
+                let embedding = if let Some(model) = image_model.as_mut() {
+                    match model.embed(vec![path], None) {
+                        Ok(mut embeddings) => embeddings.pop(),
+                        Err(_) => {
+                            // A single unreadable/unsupported image should not abort the
+                            // complete scan. Disable semantic indexing for the remainder and
+                            // keep the filename/OCR index usable.
+                            image_model = None;
+                            semantic_available = false;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 records.push(ImageRecord {
                     id: path_text.clone(),
                     path: path_text,
@@ -285,6 +320,7 @@ fn build_index(
                     },
                     people: vec![],
                     score: 1.0,
+                    embedding,
                 });
             }
             Err(_) => skipped += 1,
@@ -300,6 +336,7 @@ fn build_index(
                     indexed: records.len(),
                     skipped,
                     ocr_available,
+                    semantic_available,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -313,6 +350,7 @@ fn build_index(
         indexed,
         skipped,
         ocr_available,
+        semantic_available,
     })
 }
 
@@ -330,14 +368,55 @@ async fn scan_folder(
         .map_err(|error| format!("索引工作意外中止：{error}"))?
 }
 
-#[tauri::command]
-fn search_images(query: String, index: State<'_, AppIndex>) -> Result<Vec<ImageRecord>, String> {
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for (left_value, right_value) in left.iter().zip(right.iter()) {
+        dot += left_value * right_value;
+        left_norm += left_value * left_value;
+        right_norm += right_value * right_value;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+fn embed_query(query: &str) -> Option<Vec<f32>> {
+    let model_lock = TEXT_MODEL.get_or_init(|| Mutex::new(None));
+    let mut model = model_lock.lock().ok()?;
+    if model.is_none() {
+        *model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::ClipVitB32).with_show_download_progress(false),
+        )
+        .ok();
+    }
+    model
+        .as_ref()?
+        .embed(vec![query.to_owned()], None)
+        .ok()?
+        .pop()
+}
+
+fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>, String> {
     let terms: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
         .map(str::to_owned)
         .collect();
     let records = index.0.lock().map_err(|_| "索引暫時無法使用。")?;
+    let query_embedding =
+        if !query.trim().is_empty() && records.iter().any(|record| record.embedding.is_some()) {
+            embed_query(&query)
+        } else {
+            None
+        };
+    let semantic_search = query_embedding.is_some();
     let mut matches: Vec<ImageRecord> = records
         .iter()
         .filter_map(|record| {
@@ -364,15 +443,32 @@ fn search_images(query: String, index: State<'_, AppIndex>) -> Result<Vec<ImageR
                         )
                 })
                 .count();
-            (terms.is_empty() || matched > 0).then(|| {
-                let mut copy = record.clone();
-                copy.score = if terms.is_empty() {
-                    1.0
-                } else {
-                    matched as f32 / terms.len() as f32
-                };
-                copy
-            })
+            let lexical_score = if terms.is_empty() {
+                0.0
+            } else {
+                matched as f32 / terms.len() as f32
+            };
+            let semantic_score = query_embedding
+                .as_ref()
+                .zip(record.embedding.as_ref())
+                .map(|(query_vector, image_vector)| {
+                    // Map cosine [-1, 1] to [0, 1] for blending with lexical score.
+                    (cosine_similarity(query_vector, image_vector) + 1.0) / 2.0
+                })
+                .unwrap_or(0.0);
+            (terms.is_empty() || matched > 0 || record.embedding.is_some() && semantic_search).then(
+                || {
+                    let mut copy = record.clone();
+                    copy.score = if semantic_search {
+                        semantic_score * 0.85 + lexical_score * 0.15
+                    } else if terms.is_empty() {
+                        1.0
+                    } else {
+                        lexical_score
+                    };
+                    copy
+                },
+            )
         })
         .collect();
     matches.sort_by(|a, b| {
@@ -386,11 +482,37 @@ fn search_images(query: String, index: State<'_, AppIndex>) -> Result<Vec<ImageR
     Ok(matches)
 }
 
+#[tauri::command]
+async fn search_images(
+    query: String,
+    index: State<'_, AppIndex>,
+) -> Result<Vec<ImageRecord>, String> {
+    let index = index.inner().clone();
+    // Text model initialization and vector ranking can also be expensive on the
+    // first query, so keep them off the WebView thread.
+    tauri::async_runtime::spawn_blocking(move || search_images_sync(query, index))
+        .await
+        .map_err(|error| format!("搜尋工作意外中止：{error}"))?
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppIndex::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            // Installed applications may not be allowed to write beside the executable.
+            // Keep FastEmbed's downloaded models in the platform app-data directory while
+            // still allowing FASTEMBED_CACHE_DIR to override it for development.
+            if std::env::var_os("FASTEMBED_CACHE_DIR").is_none() {
+                if let Ok(app_data) = app.path().app_data_dir() {
+                    let model_dir = app_data.join("models");
+                    let _ = fs::create_dir_all(&model_dir);
+                    std::env::set_var("FASTEMBED_CACHE_DIR", model_dir);
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![scan_folder, search_images])
         .run(tauri::generate_context!())
         .expect("error while running Local Lens");

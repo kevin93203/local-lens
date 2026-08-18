@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 walkdir = "2.5"
 image = { version = "0.24.9", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 base64 = "0.22"
+fastembed = "=4.9.1"
 # Keep the dependency graph compatible with the Rust 1.82 toolchain used by
 # the project.  Newer `time` releases use the Rust 2024 edition (Cargo 1.85+).
 # This can be removed after upgrading the Rust toolchain.
