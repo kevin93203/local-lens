@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex, OnceLock},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -229,6 +229,7 @@ struct ScanResult {
 struct ScanProgress {
     processed: usize,
     total: usize,
+    eta_seconds: Option<u64>,
     indexed: usize,
     reused: usize,
     skipped: usize,
@@ -267,6 +268,18 @@ fn wait_for_scan_resume(control: &ScanControl) -> Result<(), String> {
         paused = control.wake.wait(paused).map_err(|_| "掃描控制暫時無法使用。")?;
     }
     Ok(())
+}
+
+fn estimate_remaining_seconds(started_at: Instant, processed: usize, total: usize) -> Option<u64> {
+    if processed == 0 || total == 0 || processed >= total {
+        return (processed >= total && total > 0).then_some(0);
+    }
+    let elapsed = started_at.elapsed().as_secs_f64();
+    if elapsed < 0.5 {
+        return None;
+    }
+    let seconds = ((total - processed) as f64 * elapsed / processed as f64).ceil();
+    Some(seconds.max(0.0) as u64)
 }
 
 fn thumbnail_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -1026,11 +1039,13 @@ fn build_index(
     }
     let gpu_warning = (!gpu_warnings.is_empty()).then(|| gpu_warnings.join("；"));
     let face_available = face_engine.is_some() || !face_clusters.is_empty();
+    let scan_started_at = Instant::now();
     app.emit(
         "scan-progress",
         ScanProgress {
             processed: 0,
             total,
+            eta_seconds: estimate_remaining_seconds(scan_started_at, 0, total),
             indexed: 0,
             reused: 0,
             skipped: 0,
@@ -1075,6 +1090,7 @@ fn build_index(
                         ScanProgress {
                             processed,
                             total,
+                            eta_seconds: estimate_remaining_seconds(scan_started_at, processed, total),
                             indexed: records.len(),
                             reused,
                             skipped,
@@ -1195,6 +1211,7 @@ fn build_index(
                 ScanProgress {
                     processed,
                     total,
+                    eta_seconds: estimate_remaining_seconds(scan_started_at, processed, total),
                     indexed: records.len(),
                     reused,
                     skipped,

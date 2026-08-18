@@ -21,11 +21,26 @@ type ImageRecord = {
 
 type FaceGroup = { id: string; name?: string; face_count: number; image_count: number; preview: string };
 type ScanResult = { root: string; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; face_groups: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
-type ScanProgress = { processed: number; total: number; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
+type ScanProgress = { processed: number; total: number; eta_seconds: number | null; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
 type ModelSettings = { max_indexed_images: number | null; index_batch_size: number; thumbnail_gpu: boolean; ocr_gpu: boolean; clip_gpu: boolean; face_gpu: boolean };
 type SettingsInfo = { settings: ModelSettings; directml_available: boolean; directml_error?: string | null; thumbnail_gpu_available: boolean; ocr_gpu_experimental: boolean };
 
 const DEFAULT_MODEL_SETTINGS: ModelSettings = { max_indexed_images: 3000, index_batch_size: 50, thumbnail_gpu: false, ocr_gpu: false, clip_gpu: false, face_gpu: false };
+
+function formatEta(seconds: number | null): string {
+  if (seconds === null) return "正在估算完成時間…";
+  if (seconds <= 0) return "即將完成";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  const duration = hours > 0
+    ? `${hours} 小時 ${minutes} 分鐘`
+    : minutes > 0
+      ? `${minutes} 分鐘 ${remainingSeconds} 秒`
+      : `${remainingSeconds} 秒`;
+  const finishAt = new Date(Date.now() + seconds * 1000).toLocaleTimeString("zh-TW", { hour: "2-digit", minute: "2-digit" });
+  return `預估剩餘 ${duration}（約 ${finishAt} 完成）`;
+}
 
 function App() {
   const [query, setQuery] = useState("");
@@ -83,7 +98,7 @@ function App() {
     const selected = await open({ directory: true, multiple: false, title: "選擇照片資料夾" });
     if (!selected || Array.isArray(selected)) return;
     setBusy(true);
-    setScanProgress({ processed: 0, total: 0, indexed: 0, reused: 0, skipped: 0, ocr_available: false, semantic_available: false, face_available: false, faces_detected: 0, clip_gpu_active: false, face_gpu_active: false, thumbnail_gpu_requested: settingsInfo?.settings.thumbnail_gpu ?? false, thumbnail_gpu_active: false, ocr_gpu_requested: settingsInfo?.settings.ocr_gpu ?? false, ocr_gpu_active: false, gpu_warning: null });
+    setScanProgress({ processed: 0, total: 0, eta_seconds: null, indexed: 0, reused: 0, skipped: 0, ocr_available: false, semantic_available: false, face_available: false, faces_detected: 0, clip_gpu_active: false, face_gpu_active: false, thumbnail_gpu_requested: settingsInfo?.settings.thumbnail_gpu ?? false, thumbnail_gpu_active: false, ocr_gpu_requested: settingsInfo?.settings.ocr_gpu ?? false, ocr_gpu_active: false, gpu_warning: null });
     setStatus("正在產生縮圖、OCR、語意與人臉向量（首次使用可能下載模型）…");
     try {
       const result = await invoke<ScanResult>("scan_folder", { folder: selected });
@@ -253,6 +268,7 @@ function App() {
             <span>正在建立圖片索引</span>
             <span>{scanPaused ? "已暫停" : (scanProgress.total ? `${scanProgress.processed} / ${scanProgress.total}` : "正在統計圖片…")}</span>
           </div>
+          <div className="progress-eta">{scanPaused ? `暫停中 · ${formatEta(scanProgress.eta_seconds)}` : formatEta(scanProgress.eta_seconds)}</div>
           <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={scanProgress.total || undefined} aria-valuenow={scanProgress.processed}>
             <div className="progress-fill" style={{ width: scanProgress.total ? `${Math.round((scanProgress.processed / scanProgress.total) * 100)}%` : "3%" }} />
           </div>

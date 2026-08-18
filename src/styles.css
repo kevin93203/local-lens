@@ -43,6 +43,7 @@ form button { padding: 10px 16px; }
 .progress-panel { margin-top: 15px; border: 1px solid #466b42; border-radius: 14px; background: #17211b; padding: 14px 16px; }
 .progress-label { display: flex; justify-content: space-between; gap: 16px; color: #e2eddf; font-size: .88rem; font-weight: 700; }
 .progress-label span:last-child { color: #c7f36b; font-variant-numeric: tabular-nums; }
+.progress-eta { margin-top: 5px; color: #c7f36b; font-size: .76rem; font-variant-numeric: tabular-nums; }
 .progress-track { height: 8px; overflow: hidden; background: #0d140f; border-radius: 10px; margin-top: 11px; }
 .progress-fill { height: 100%; min-width: 3%; border-radius: inherit; background: linear-gradient(90deg, #8dca70, #c7f36b); transition: width .2s ease-out; }
 .progress-panel p { margin: 9px 0 0; color: #91a095; font-size: .78rem; }
