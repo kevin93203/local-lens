@@ -10,6 +10,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use fast_image_resize as fir;
 use fastembed::{
     EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions,
     TextEmbedding,
@@ -177,14 +178,55 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn thumbnail_dimensions(width: u32, height: u32) -> (u32, u32) {
+    const THUMBNAIL_BOUND: u32 = 480;
+    if width >= height {
+        (
+            THUMBNAIL_BOUND,
+            ((height as u64 * THUMBNAIL_BOUND as u64 + width as u64 / 2) / width as u64)
+                .max(1) as u32,
+        )
+    } else {
+        (
+            ((width as u64 * THUMBNAIL_BOUND as u64 + height as u64 / 2) / height as u64)
+                .max(1) as u32,
+            THUMBNAIL_BOUND,
+        )
+    }
+}
+
 fn make_thumbnail(path: &Path, _use_gpu: bool) -> Result<(String, u32, u32), String> {
-    // Keep the accelerator preference at this boundary. The `image` crate's
-    // decoder/resizer currently has a CPU implementation, but accepting the
-    // setting here keeps thumbnail creation separate from the model settings
-    // and allows a GPU image backend to be introduced without changing IPC.
     let image = image::open(path).map_err(|error| error.to_string())?;
     let (width, height) = (image.width(), image.height());
-    let thumbnail = image.resize(480, 480, FilterType::Triangle).to_rgb8();
+    let source = image.to_rgb8();
+    let (thumbnail_width, thumbnail_height) = thumbnail_dimensions(width, height);
+    let source = fir::images::Image::from_vec_u8(
+        width,
+        height,
+        source.into_raw(),
+        fir::PixelType::U8x3,
+    )
+    .map_err(|error| format!("無法準備縮圖像素：{error}"))?;
+    let mut destination = fir::images::Image::new(
+        thumbnail_width,
+        thumbnail_height,
+        fir::PixelType::U8x3,
+    );
+    fir::Resizer::new()
+        .resize(
+            &source,
+            &mut destination,
+            &fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
+                fir::FilterType::Bilinear,
+            )),
+        )
+        .map_err(|error| format!("縮放縮圖失敗：{error}"))?;
+    let thumbnail = image::RgbImage::from_raw(
+        thumbnail_width,
+        thumbnail_height,
+        destination.into_vec(),
+    )
+    .ok_or_else(|| "縮圖像素格式不正確。".to_owned())?;
     let mut bytes = Vec::new();
     JpegEncoder::new_with_quality(&mut bytes, 78)
         .encode_image(&thumbnail)
@@ -1233,6 +1275,13 @@ mod tests {
         assert!(!settings.thumbnail_gpu);
         assert!(!settings.face_gpu);
         assert!(!settings.ocr_gpu);
+    }
+
+    #[test]
+    fn thumbnail_dimensions_fit_the_longest_edge() {
+        assert_eq!(thumbnail_dimensions(4_000, 3_000), (480, 360));
+        assert_eq!(thumbnail_dimensions(3_000, 4_000), (360, 480));
+        assert_eq!(thumbnail_dimensions(1, 1), (480, 480));
     }
 
     #[cfg(windows)]
