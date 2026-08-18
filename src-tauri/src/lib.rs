@@ -47,6 +47,7 @@ static DIRECTML_AVAILABLE: OnceLock<bool> = OnceLock::new();
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct ModelSettings {
+    thumbnail_gpu: bool,
     ocr_gpu: bool,
     clip_gpu: bool,
     face_gpu: bool,
@@ -55,6 +56,7 @@ struct ModelSettings {
 impl Default for ModelSettings {
     fn default() -> Self {
         Self {
+            thumbnail_gpu: false,
             ocr_gpu: false,
             clip_gpu: false,
             face_gpu: false,
@@ -140,6 +142,7 @@ struct ScanResult {
     face_groups: usize,
     clip_gpu_active: bool,
     face_gpu_active: bool,
+    thumbnail_gpu_requested: bool,
     ocr_gpu_requested: bool,
     gpu_warning: Option<String>,
 }
@@ -156,6 +159,7 @@ struct ScanProgress {
     faces_detected: usize,
     clip_gpu_active: bool,
     face_gpu_active: bool,
+    thumbnail_gpu_requested: bool,
     ocr_gpu_requested: bool,
     gpu_warning: Option<String>,
 }
@@ -167,7 +171,11 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn make_thumbnail(path: &Path) -> Result<(String, u32, u32), String> {
+fn make_thumbnail(path: &Path, _use_gpu: bool) -> Result<(String, u32, u32), String> {
+    // Keep the accelerator preference at this boundary. The `image` crate's
+    // decoder/resizer currently has a CPU implementation, but accepting the
+    // setting here keeps thumbnail creation separate from the model settings
+    // and allows a GPU image backend to be introduced without changing IPC.
     let image = image::open(path).map_err(|error| error.to_string())?;
     let (width, height) = (image.width(), image.height());
     let thumbnail = image.resize(480, 480, FilterType::Triangle).to_rgb8();
@@ -658,13 +666,14 @@ fn build_index(
             faces_detected,
             clip_gpu_active,
             face_gpu_active,
+            thumbnail_gpu_requested: settings.thumbnail_gpu,
             ocr_gpu_requested: settings.ocr_gpu,
             gpu_warning: gpu_warning.clone(),
         },
     )
     .map_err(|error| error.to_string())?;
     for (position, path) in candidates.iter().enumerate() {
-        match make_thumbnail(path) {
+        match make_thumbnail(path, settings.thumbnail_gpu) {
             Ok((thumbnail, width, height)) => {
                 let path_text = path.to_string_lossy().into_owned();
                 let embedding = if let Some(model) = image_model.as_mut() {
@@ -760,6 +769,7 @@ fn build_index(
                     faces_detected,
                     clip_gpu_active,
                     face_gpu_active,
+                    thumbnail_gpu_requested: settings.thumbnail_gpu,
                     ocr_gpu_requested: settings.ocr_gpu,
                     gpu_warning: gpu_warning.clone(),
                 },
@@ -785,6 +795,7 @@ fn build_index(
         face_groups,
         clip_gpu_active,
         face_gpu_active,
+        thumbnail_gpu_requested: settings.thumbnail_gpu,
         ocr_gpu_requested: settings.ocr_gpu,
         gpu_warning,
     })
@@ -1163,6 +1174,7 @@ mod tests {
     fn model_settings_are_backward_compatible() {
         let settings: ModelSettings = serde_json::from_str(r#"{"clip_gpu":true}"#).unwrap();
         assert!(settings.clip_gpu);
+        assert!(!settings.thumbnail_gpu);
         assert!(!settings.face_gpu);
         assert!(!settings.ocr_gpu);
     }
