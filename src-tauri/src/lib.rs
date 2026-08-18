@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
     hash::{Hash, Hasher},
@@ -20,6 +20,7 @@ use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageFormat};
 #[cfg(windows)]
 use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
 use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection};
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
@@ -93,7 +94,65 @@ struct ImageRecord {
     face_group_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedImageRecord {
+    filename: String,
+    modified_at: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    thumbnail: String,
+    ocr_text: String,
+    people: Vec<String>,
+    embedding: Option<Vec<f32>>,
+    face_group_ids: Vec<String>,
+}
+
+impl CachedImageRecord {
+    fn from_record(record: &ImageRecord) -> Self {
+        Self {
+            filename: record.filename.clone(),
+            modified_at: record.modified_at.clone(),
+            width: record.width,
+            height: record.height,
+            thumbnail: record.thumbnail.clone(),
+            ocr_text: record.ocr_text.clone(),
+            people: record.people.clone(),
+            embedding: record.embedding.clone(),
+            face_group_ids: record.face_group_ids.clone(),
+        }
+    }
+
+    fn into_record(self, path: String) -> ImageRecord {
+        ImageRecord {
+            id: path.clone(),
+            path,
+            filename: self.filename,
+            modified_at: self.modified_at,
+            width: self.width,
+            height: self.height,
+            thumbnail: self.thumbnail,
+            ocr_text: self.ocr_text,
+            people: self.people,
+            score: 1.0,
+            embedding: self.embedding,
+            face_group_ids: self.face_group_ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileFingerprint {
+    bytes: u64,
+    modified_ns: u128,
+}
+
 #[derive(Debug, Clone)]
+struct CachedImage {
+    fingerprint: FileFingerprint,
+    record: CachedImageRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FaceCluster {
     id: String,
     name: Option<String>,
@@ -131,12 +190,14 @@ struct AppIndex {
     people_file: Arc<Mutex<Option<PathBuf>>>,
     settings: Arc<Mutex<ModelSettings>>,
     settings_file: Arc<Mutex<Option<PathBuf>>>,
+    cache_file: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[derive(Serialize)]
 struct ScanResult {
     root: String,
     indexed: usize,
+    reused: usize,
     skipped: usize,
     ocr_available: bool,
     semantic_available: bool,
@@ -157,6 +218,7 @@ struct ScanProgress {
     processed: usize,
     total: usize,
     indexed: usize,
+    reused: usize,
     skipped: usize,
     ocr_available: bool,
     semantic_available: bool,
@@ -378,6 +440,149 @@ fn people_file(index: &AppIndex) -> Option<PathBuf> {
 
 fn settings_file(index: &AppIndex) -> Option<PathBuf> {
     index.settings_file.lock().ok()?.clone()
+}
+
+fn cache_file(index: &AppIndex) -> Option<PathBuf> {
+    index.cache_file.lock().ok()?.clone()
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = path.metadata().ok()?;
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(FileFingerprint {
+        bytes: metadata.len(),
+        modified_ns,
+    })
+}
+
+fn open_index_cache(path: &Path) -> Result<Connection, String> {
+    let connection = Connection::open(path).map_err(|error| format!("無法開啟 SQLite 索引快取：{error}"))?;
+    connection
+        .execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS image_cache (
+                root TEXT NOT NULL,
+                path TEXT PRIMARY KEY NOT NULL,
+                bytes INTEGER NOT NULL,
+                modified_ns TEXT NOT NULL,
+                record_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS image_cache_root ON image_cache(root);
+            CREATE TABLE IF NOT EXISTS scan_state (
+                root TEXT PRIMARY KEY NOT NULL,
+                face_groups_json TEXT NOT NULL
+            );
+            ",
+        )
+        .map_err(|error| format!("無法初始化 SQLite 索引快取：{error}"))?;
+    Ok(connection)
+}
+
+fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, CachedImage> {
+    let Some(path) = path else { return HashMap::new() };
+    let Ok(connection) = open_index_cache(path) else { return HashMap::new() };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT path, bytes, modified_ns, record_json FROM image_cache WHERE root = ?1",
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map(params![root], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    }) else {
+        return HashMap::new();
+    };
+    rows.filter_map(Result::ok)
+        .filter_map(|(path, bytes, modified_ns, record_json)| {
+            Some((
+                path,
+                CachedImage {
+                    fingerprint: FileFingerprint {
+                        bytes,
+                        modified_ns: modified_ns.parse().ok()?,
+                    },
+                    record: serde_json::from_str(&record_json).ok()?,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn load_cached_face_groups(path: Option<&Path>, root: &str) -> Vec<FaceCluster> {
+    let Some(path) = path else { return Vec::new() };
+    let Ok(connection) = open_index_cache(path) else { return Vec::new() };
+    connection
+        .query_row(
+            "SELECT face_groups_json FROM scan_state WHERE root = ?1",
+            params![root],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn save_index_cache(
+    path: Option<&Path>,
+    root: &str,
+    records: &[ImageRecord],
+    fingerprints: &HashMap<String, FileFingerprint>,
+    face_groups: &[FaceCluster],
+) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let mut connection = open_index_cache(path)?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM image_cache WHERE root = ?1", params![root])
+        .map_err(|error| error.to_string())?;
+    {
+        let mut insert = transaction
+            .prepare("INSERT INTO image_cache(root, path, bytes, modified_ns, record_json) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .map_err(|error| error.to_string())?;
+        for record in records {
+            let Some(fingerprint) = fingerprints.get(&record.path) else { continue };
+            let payload = serde_json::to_string(&CachedImageRecord::from_record(record))
+                .map_err(|error| error.to_string())?;
+            insert
+                .execute(params![root, record.path, fingerprint.bytes, fingerprint.modified_ns.to_string(), payload])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let face_groups_json = serde_json::to_string(face_groups).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO scan_state(root, face_groups_json) VALUES (?1, ?2) \
+             ON CONFLICT(root) DO UPDATE SET face_groups_json = excluded.face_groups_json",
+            params![root, face_groups_json],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn refresh_face_cluster_counts(face_clusters: &mut Vec<FaceCluster>, records: &[ImageRecord]) {
+    for cluster in face_clusters.iter_mut() {
+        cluster.face_count = 0;
+        cluster.image_ids.clear();
+    }
+    for record in records {
+        for group_id in &record.face_group_ids {
+            if let Some(cluster) = face_clusters.iter_mut().find(|cluster| cluster.id == *group_id) {
+                cluster.face_count += 1;
+                cluster.image_ids.insert(record.id.clone());
+            }
+        }
+    }
+    face_clusters.retain(|cluster| cluster.face_count > 0);
 }
 
 fn current_settings(index: &AppIndex) -> ModelSettings {
@@ -697,8 +902,27 @@ fn build_index(
         .take(MAX_INDEXED_IMAGES)
         .collect();
     let total = candidates.len();
+    let cache_path = cache_file(&index);
+    let cached_images = load_cached_images(cache_path.as_deref(), &folder);
+    let fingerprints: HashMap<String, FileFingerprint> = candidates
+        .iter()
+        .filter_map(|path| {
+            let path_text = path.to_string_lossy().into_owned();
+            file_fingerprint(path).map(|fingerprint| (path_text, fingerprint))
+        })
+        .collect();
+    let needs_processing = candidates.iter().any(|path| {
+        let path_text = path.to_string_lossy();
+        !matches!(
+            (fingerprints.get(path_text.as_ref()), cached_images.get(path_text.as_ref())),
+            (Some(current), Some(cached))
+                if current.bytes == cached.fingerprint.bytes
+                    && current.modified_ns == cached.fingerprint.modified_ns
+        )
+    });
     let mut records = Vec::new();
-    let mut face_clusters = Vec::new();
+    let mut reused = 0;
+    let mut face_clusters = load_cached_face_groups(cache_path.as_deref(), &folder);
     let known_people = load_known_people(&index);
     let mut faces_detected = 0;
     let mut skipped = 0;
@@ -725,28 +949,36 @@ fn build_index(
             gpu_warnings.push(format!("Face GPU：{reason}，已使用 CPU"));
         }
     }
-    let (mut image_model, clip_gpu_active, clip_gpu_error) =
-        load_image_embedding(settings.clip_gpu && gpu_available);
+    let (mut image_model, clip_gpu_active, clip_gpu_error) = if needs_processing {
+        load_image_embedding(settings.clip_gpu && gpu_available)
+    } else {
+        (None, false, None)
+    };
     if let Some(error) = clip_gpu_error {
         gpu_warnings.push(error);
     }
-    let mut semantic_available = image_model.is_some();
-    let (mut face_engine, face_gpu_active, face_gpu_error) =
+    let mut semantic_available = image_model.is_some()
+        || cached_images.values().any(|cached| cached.record.embedding.is_some());
+    let (mut face_engine, face_gpu_active, face_gpu_error) = if needs_processing {
         match load_face_engine(settings.face_gpu && gpu_available) {
             Ok((engine, active, error)) => (Some(engine), active, error),
             Err(error) => (None, false, Some(error)),
-        };
+        }
+    } else {
+        (None, false, None)
+    };
     if let Some(error) = face_gpu_error {
         gpu_warnings.push(error);
     }
     let gpu_warning = (!gpu_warnings.is_empty()).then(|| gpu_warnings.join("；"));
-    let face_available = face_engine.is_some();
+    let face_available = face_engine.is_some() || !face_clusters.is_empty();
     app.emit(
         "scan-progress",
         ScanProgress {
             processed: 0,
             total,
             indexed: 0,
+            reused: 0,
             skipped: 0,
             ocr_available,
             semantic_available,
@@ -763,9 +995,42 @@ fn build_index(
     )
     .map_err(|error| error.to_string())?;
     for (position, path) in candidates.iter().enumerate() {
+        let path_text = path.to_string_lossy().into_owned();
+        if let (Some(current), Some(cached)) = (fingerprints.get(&path_text), cached_images.get(&path_text)) {
+            if current.bytes == cached.fingerprint.bytes && current.modified_ns == cached.fingerprint.modified_ns {
+                faces_detected += cached.record.face_group_ids.len();
+                records.push(cached.record.clone().into_record(path_text));
+                reused += 1;
+                let processed = position + 1;
+                if processed == total || processed % 5 == 0 {
+                    app.emit(
+                        "scan-progress",
+                        ScanProgress {
+                            processed,
+                            total,
+                            indexed: records.len(),
+                            reused,
+                            skipped,
+                            ocr_available,
+                            semantic_available: semantic_available || records.iter().any(|record| record.embedding.is_some()),
+                            face_available,
+                            faces_detected,
+                            clip_gpu_active,
+                            face_gpu_active,
+                            thumbnail_gpu_requested: settings.thumbnail_gpu,
+                            thumbnail_gpu_active: false,
+                            ocr_gpu_requested: settings.ocr_gpu,
+                            ocr_gpu_active,
+                            gpu_warning: gpu_warning.clone(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                continue;
+            }
+        }
         match make_thumbnail(path, settings.thumbnail_gpu) {
             Ok((thumbnail, width, height)) => {
-                let path_text = path.to_string_lossy().into_owned();
                 let embedding = if let Some(model) = image_model.as_mut() {
                     match model.embed(vec![path], None) {
                         Ok(mut embeddings) => embeddings.pop(),
@@ -852,6 +1117,7 @@ fn build_index(
                     processed,
                     total,
                     indexed: records.len(),
+                    reused,
                     skipped,
                     ocr_available,
                     semantic_available,
@@ -870,6 +1136,15 @@ fn build_index(
         }
     }
     records.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
+    refresh_face_cluster_counts(&mut face_clusters, &records);
+    // A cache write failure must not discard the freshly built in-memory index.
+    let _ = save_index_cache(
+        cache_path.as_deref(),
+        &folder,
+        &records,
+        &fingerprints,
+        &face_clusters,
+    );
     let indexed = records.len();
     let face_groups = face_clusters.len();
     *index.data.lock().map_err(|_| "索引暫時無法使用。")? = IndexData {
@@ -879,6 +1154,7 @@ fn build_index(
     Ok(ScanResult {
         root: folder,
         indexed,
+        reused,
         skipped,
         ocr_available,
         semantic_available,
@@ -1284,6 +1560,45 @@ mod tests {
         assert_eq!(thumbnail_dimensions(1, 1), (480, 480));
     }
 
+    #[test]
+    fn sqlite_index_cache_round_trip() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "local-lens-cache-test-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let root = "C:\\Photos";
+        let path = "C:\\Photos\\sample.jpg".to_owned();
+        let record = ImageRecord {
+            id: path.clone(),
+            path: path.clone(),
+            filename: "sample.jpg".to_owned(),
+            modified_at: "2026-08-19".to_owned(),
+            width: Some(1200),
+            height: Some(800),
+            thumbnail: "data:image/jpeg;base64,test".to_owned(),
+            ocr_text: "receipt".to_owned(),
+            people: vec!["Tony".to_owned()],
+            score: 1.0,
+            embedding: Some(vec![0.25, 0.75]),
+            face_group_ids: vec!["face-1".to_owned()],
+        };
+        let fingerprints = HashMap::from([(
+            path.clone(),
+            FileFingerprint {
+                bytes: 42,
+                modified_ns: 123,
+            },
+        )]);
+        save_index_cache(Some(&cache_path), root, &[record], &fingerprints, &[]).unwrap();
+        let cached = load_cached_images(Some(&cache_path), root);
+        let cached_record = cached.get(&path).unwrap();
+        assert_eq!(cached_record.fingerprint.bytes, 42);
+        assert_eq!(cached_record.record.ocr_text, "receipt");
+        assert_eq!(cached_record.record.embedding, Some(vec![0.25, 0.75]));
+        let _ = fs::remove_file(cache_path);
+    }
+
     #[cfg(windows)]
     #[test]
     fn directml_capability_probe_is_safe() {
@@ -1318,6 +1633,9 @@ pub fn run() {
                 }
                 if let Ok(mut settings_file) = index.settings_file.lock() {
                     *settings_file = Some(model_settings_file);
+                };
+                if let Ok(mut cache_file) = index.cache_file.lock() {
+                    *cache_file = Some(app_data.join("index.sqlite3"));
                 };
             }
             Ok(())

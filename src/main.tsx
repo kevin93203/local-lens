@@ -20,8 +20,8 @@ type ImageRecord = {
 };
 
 type FaceGroup = { id: string; name?: string; face_count: number; image_count: number; preview: string };
-type ScanResult = { root: string; indexed: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; face_groups: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
-type ScanProgress = { processed: number; total: number; indexed: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
+type ScanResult = { root: string; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; face_groups: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
+type ScanProgress = { processed: number; total: number; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
 type ModelSettings = { thumbnail_gpu: boolean; ocr_gpu: boolean; clip_gpu: boolean; face_gpu: boolean };
 type SettingsInfo = { settings: ModelSettings; directml_available: boolean; directml_error?: string | null; thumbnail_gpu_available: boolean; ocr_gpu_experimental: boolean };
 
@@ -81,7 +81,7 @@ function App() {
     const selected = await open({ directory: true, multiple: false, title: "選擇照片資料夾" });
     if (!selected || Array.isArray(selected)) return;
     setBusy(true);
-    setScanProgress({ processed: 0, total: 0, indexed: 0, skipped: 0, ocr_available: false, semantic_available: false, face_available: false, faces_detected: 0, clip_gpu_active: false, face_gpu_active: false, thumbnail_gpu_requested: settingsInfo?.settings.thumbnail_gpu ?? false, thumbnail_gpu_active: false, ocr_gpu_requested: settingsInfo?.settings.ocr_gpu ?? false, ocr_gpu_active: false, gpu_warning: null });
+    setScanProgress({ processed: 0, total: 0, indexed: 0, reused: 0, skipped: 0, ocr_available: false, semantic_available: false, face_available: false, faces_detected: 0, clip_gpu_active: false, face_gpu_active: false, thumbnail_gpu_requested: settingsInfo?.settings.thumbnail_gpu ?? false, thumbnail_gpu_active: false, ocr_gpu_requested: settingsInfo?.settings.ocr_gpu ?? false, ocr_gpu_active: false, gpu_warning: null });
     setStatus("正在產生縮圖、OCR、語意與人臉向量（首次使用可能下載模型）…");
     try {
       const result = await invoke<ScanResult>("scan_folder", { folder: selected });
@@ -95,7 +95,7 @@ function App() {
       setFaceGroups(groups);
       setFaceNames(Object.fromEntries(groups.map((group) => [group.id, group.name ?? ""])));
       const gpuWarning = result.gpu_warning ? `；⚠ ${result.gpu_warning}` : "";
-      setStatus(`已索引 ${result.indexed} 張圖片，先載入最多 200 張預覽；縮圖${result.thumbnail_gpu_requested ? `（${result.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : "使用一般處理流程"}；${result.ocr_available ? `OCR 已啟用${result.ocr_gpu_requested ? `（${result.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "找不到 Tesseract，僅使用檔名搜尋"}；${result.semantic_available ? `Semantic Search 已啟用${result.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒，僅使用文字搜尋"}；${result.face_available ? `偵測到 ${result.faces_detected} 張臉、${result.face_groups} 個人物群組${result.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}${result.skipped ? `；略過 ${result.skipped} 個無法讀取的檔案` : ""}${gpuWarning}。`);
+      setStatus(`已索引 ${result.indexed} 張圖片${result.reused ? `（重用 ${result.reused} 筆 SQLite 快取）` : ""}，先載入最多 200 張預覽；縮圖${result.thumbnail_gpu_requested ? `（${result.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : "使用一般處理流程"}；${result.ocr_available ? `OCR 已啟用${result.ocr_gpu_requested ? `（${result.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "找不到 Tesseract，僅使用檔名搜尋"}；${result.semantic_available ? `Semantic Search 已啟用${result.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒，僅使用文字搜尋"}；${result.face_available ? `偵測到 ${result.faces_detected} 張臉、${result.face_groups} 個人物群組${result.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}${result.skipped ? `；略過 ${result.skipped} 個無法讀取的檔案` : ""}${gpuWarning}。`);
     } catch (error) {
       setStatus(`建立索引失敗：${String(error)}`);
     } finally {
@@ -223,7 +223,7 @@ function App() {
           <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={scanProgress.total || undefined} aria-valuenow={scanProgress.processed}>
             <div className="progress-fill" style={{ width: scanProgress.total ? `${Math.round((scanProgress.processed / scanProgress.total) * 100)}%` : "3%" }} />
           </div>
-          <p>已建立 {scanProgress.indexed} 張縮圖{scanProgress.thumbnail_gpu_requested ? `（${scanProgress.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : ""}；{scanProgress.ocr_available ? `同步進行 OCR${scanProgress.ocr_gpu_requested ? `（${scanProgress.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "OCR 未啟用"}；{scanProgress.semantic_available ? `同步建立語意向量${scanProgress.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒"}；{scanProgress.face_available ? `已偵測 ${scanProgress.faces_detected} 張臉${scanProgress.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}{scanProgress.skipped ? `；略過 ${scanProgress.skipped} 個無法讀取的檔案` : ""}{scanProgress.gpu_warning ? `；⚠ ${scanProgress.gpu_warning}` : ""}。</p>
+          <p>已建立 {scanProgress.indexed} 張縮圖{scanProgress.reused ? `（重用 ${scanProgress.reused} 筆 SQLite 快取）` : ""}{scanProgress.thumbnail_gpu_requested ? `（${scanProgress.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : ""}；{scanProgress.ocr_available ? `同步進行 OCR${scanProgress.ocr_gpu_requested ? `（${scanProgress.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "OCR 未啟用"}；{scanProgress.semantic_available ? `同步建立語意向量${scanProgress.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒"}；{scanProgress.face_available ? `已偵測 ${scanProgress.faces_detected} 張臉${scanProgress.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}{scanProgress.skipped ? `；略過 ${scanProgress.skipped} 個無法讀取的檔案` : ""}{scanProgress.gpu_warning ? `；⚠ ${scanProgress.gpu_warning}` : ""}。</p>
         </section>
       )}
 

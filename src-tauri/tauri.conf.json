@@ -5,5 +5,5 @@
   "identifier": "tw.codelove.locallens",
   "build": { "frontendDist": "../dist", "devUrl": "http://localhost:1420", "beforeDevCommand": "npm run dev", "beforeBuildCommand": "npm run build" },
   "app": { "windows": [{ "title": "Local Lens", "width": 1200, "height": 800, "minWidth": 760, "minHeight": 580 }], "security": { "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline';" } },
-  "bundle": { "active": true, "targets": "all" }
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.ico"] }
 }
