@@ -22,6 +22,8 @@ h1 { margin: 0; font: 700 clamp(2.5rem, 5vw, 4.8rem)/.95 Georgia, serif; letter-
 .setting-option { display: grid; grid-template-columns: auto 1fr; gap: 11px; align-items: start; min-height: 110px; padding: 14px; border: 1px solid #334639; border-radius: 13px; background: #0f1712; cursor: pointer; }
 .setting-option.experimental { border-color: #5b5132; }
 .setting-option input { flex: none; width: 18px; min-width: 18px; height: 18px; margin: 2px 0 0; padding: 0; accent-color: #c7f36b; }
+.setting-option.limit-option { grid-template-columns: 1fr; min-height: 0; cursor: default; }
+.setting-option .limit-input { width: 100%; min-width: 0; height: 38px; margin: 0; padding: 8px 10px; border: 1px solid #405247; border-radius: 8px; background: #0a100c; color: #edf4eb; accent-color: auto; }
 .setting-option span { display: grid; gap: 7px; }
 .setting-option strong { color: #edf4eb; font-size: .9rem; }
 .setting-option small { color: #91a095; font-size: .73rem; line-height: 1.45; }

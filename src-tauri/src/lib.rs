@@ -28,7 +28,7 @@ mod face;
 use face::{Face, FaceEngine};
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
-const MAX_INDEXED_IMAGES: usize = 3_000;
+const DEFAULT_MAX_INDEXED_IMAGES: usize = 3_000;
 const MAX_BROWSE_RESULTS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 60;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
@@ -49,6 +49,7 @@ static DIRECTML_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct ModelSettings {
+    max_indexed_images: Option<usize>,
     thumbnail_gpu: bool,
     ocr_gpu: bool,
     clip_gpu: bool,
@@ -58,6 +59,7 @@ struct ModelSettings {
 impl Default for ModelSettings {
     fn default() -> Self {
         Self {
+            max_indexed_images: Some(DEFAULT_MAX_INDEXED_IMAGES),
             thumbnail_gpu: false,
             ocr_gpu: false,
             clip_gpu: false,
@@ -899,8 +901,12 @@ fn build_index(
         .filter_map(Result::ok)
         .map(|entry| entry.into_path())
         .filter(|path| path.is_file() && is_supported_image(path))
-        .take(MAX_INDEXED_IMAGES)
         .collect();
+    let candidates = if let Some(limit) = current_settings(&index).max_indexed_images {
+        candidates.into_iter().take(limit).collect()
+    } else {
+        candidates
+    };
     let total = candidates.len();
     let cache_path = cache_file(&index);
     let cached_images = load_cached_images(cache_path.as_deref(), &folder);
@@ -1401,6 +1407,9 @@ fn update_model_settings(
     settings: ModelSettings,
     index: State<'_, AppIndex>,
 ) -> Result<SettingsInfo, String> {
+    if settings.max_indexed_images == Some(0) {
+        return Err("圖片上限至少必須是 1，或選擇無上限。".to_owned());
+    }
     if let Some(path) = settings_file(index.inner()) {
         save_settings(&path, &settings)?;
     }
@@ -1548,6 +1557,7 @@ mod tests {
     fn model_settings_are_backward_compatible() {
         let settings: ModelSettings = serde_json::from_str(r#"{"clip_gpu":true}"#).unwrap();
         assert!(settings.clip_gpu);
+        assert_eq!(settings.max_indexed_images, Some(DEFAULT_MAX_INDEXED_IMAGES));
         assert!(!settings.thumbnail_gpu);
         assert!(!settings.face_gpu);
         assert!(!settings.ocr_gpu);

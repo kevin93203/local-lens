@@ -22,10 +22,10 @@ type ImageRecord = {
 type FaceGroup = { id: string; name?: string; face_count: number; image_count: number; preview: string };
 type ScanResult = { root: string; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; face_groups: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
 type ScanProgress = { processed: number; total: number; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
-type ModelSettings = { thumbnail_gpu: boolean; ocr_gpu: boolean; clip_gpu: boolean; face_gpu: boolean };
+type ModelSettings = { max_indexed_images: number | null; thumbnail_gpu: boolean; ocr_gpu: boolean; clip_gpu: boolean; face_gpu: boolean };
 type SettingsInfo = { settings: ModelSettings; directml_available: boolean; directml_error?: string | null; thumbnail_gpu_available: boolean; ocr_gpu_experimental: boolean };
 
-const DEFAULT_MODEL_SETTINGS: ModelSettings = { thumbnail_gpu: false, ocr_gpu: false, clip_gpu: false, face_gpu: false };
+const DEFAULT_MODEL_SETTINGS: ModelSettings = { max_indexed_images: 3000, thumbnail_gpu: false, ocr_gpu: false, clip_gpu: false, face_gpu: false };
 
 function App() {
   const [query, setQuery] = useState("");
@@ -172,6 +172,16 @@ function App() {
           </div>
           {settingsInfo?.directml_error && <p className="settings-error">DirectML：{settingsInfo.directml_error}</p>}
           <div className="settings-grid">
+            <label className="setting-option">
+              <input type="checkbox" checked={settingsDraft.max_indexed_images === null} onChange={(event) => setSettingsDraft((current) => ({ ...current, max_indexed_images: event.target.checked ? null : (current.max_indexed_images ?? 3000) }))} disabled={busy} />
+              <span><strong>掃描圖片數量無上限</strong><small>啟用後會掃描資料夾內所有支援的圖片；大量照片首次建立索引可能需要較長時間與較多儲存空間。</small></span>
+            </label>
+            {settingsDraft.max_indexed_images !== null && (
+              <label className="setting-option limit-option">
+                <span><strong>每個資料夾的圖片上限</strong><small>只會處理掃描順序中的前幾張圖片。</small></span>
+                <input className="limit-input" type="number" min="1" step="1" value={settingsDraft.max_indexed_images} onChange={(event) => setSettingsDraft((current) => ({ ...current, max_indexed_images: Math.max(1, Number.parseInt(event.target.value, 10) || 1) }))} disabled={busy} />
+              </label>
+            )}
             <label className="setting-option">
               <input type="checkbox" checked={settingsDraft.thumbnail_gpu} onChange={(event) => setSettingsDraft((current) => ({ ...current, thumbnail_gpu: event.target.checked }))} disabled={busy || !settingsInfo?.thumbnail_gpu_available} />
               <span><strong>建立縮圖時使用 GPU 加速</strong><small>{settingsInfo?.thumbnail_gpu_available ? "在下一次建立索引時套用。" : "目前版本沒有 GPU 縮圖後端，因此固定使用 CPU。"}</small></span>
