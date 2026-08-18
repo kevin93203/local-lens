@@ -26,6 +26,22 @@ form button { padding: 10px 16px; }
 .progress-track { height: 8px; overflow: hidden; background: #0d140f; border-radius: 10px; margin-top: 11px; }
 .progress-fill { height: 100%; min-width: 3%; border-radius: inherit; background: linear-gradient(90deg, #8dca70, #c7f36b); transition: width .2s ease-out; }
 .progress-panel p { margin: 9px 0 0; color: #91a095; font-size: .78rem; }
+.people-panel { margin-top: 22px; padding: 18px; border: 1px solid #2b3b30; border-radius: 18px; background: #17211b; }
+.people-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 14px; }
+.people-heading .eyebrow { display: block; margin-bottom: 4px; }
+.people-heading h2 { margin: 0; font: 700 1.35rem/1.1 Georgia, serif; }
+.people-heading p { max-width: 520px; margin: 0; color: #91a095; font-size: .78rem; text-align: right; }
+.people-list { display: flex; gap: 12px; padding-bottom: 6px; overflow-x: auto; scrollbar-color: #466b42 #0d140f; }
+.face-group { flex: 0 0 190px; overflow: hidden; border: 1px solid #334639; border-radius: 13px; background: #0f1712; }
+.face-group > img { display: block; width: 100%; aspect-ratio: 1.35; object-fit: cover; background: #26322a; }
+.face-group-body { display: grid; gap: 8px; padding: 10px; }
+.face-name-input { width: 100%; padding: 8px 9px; border: 1px solid #405144; border-radius: 8px; background: #17211b; }
+.face-name-input:focus { border-color: #c7f36b; }
+.face-group-body small { color: #91a095; font-size: .7rem; }
+.face-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.face-actions button { border: 0; border-radius: 8px; padding: 7px 9px; color: #102016; background: #c7f36b; font-size: .73rem; font-weight: 800; }
+.face-actions button.secondary { color: #c7f36b; border: 1px solid #466b42; background: transparent; }
+.face-actions button:disabled { opacity: .5; cursor: wait; }
 .results { margin-top: 30px; }
 .result-heading { display: flex; justify-content: space-between; color: #aebbb0; font-size: .9rem; margin-bottom: 15px; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 15px; }
@@ -40,4 +56,4 @@ form button { padding: 10px 16px; }
 .empty { margin: 76px auto; text-align: center; color: #99a69b; max-width: 420px; }
 .empty div { color: #c7f36b; font-size: 3rem; }.empty h2 { color: #e6ece6; margin-bottom: 7px; }.empty p { margin: 0; line-height: 1.6; }
 footer { color: #66756a; font-size: .76rem; margin-top: 48px; text-align: center; }
-@media (max-width: 650px) { main { width: min(100% - 30px, 1440px); padding-top: 30px; } header { display: grid; }.folder-button { width: 100%; } form { flex-wrap: wrap; } form input { min-width: 80%; } form button { width: 100%; }.folder-name { display: none; }.gallery { grid-template-columns: repeat(2, 1fr); gap: 10px; } }
+@media (max-width: 650px) { main { width: min(100% - 30px, 1440px); padding-top: 30px; } header { display: grid; }.folder-button { width: 100%; } form { flex-wrap: wrap; } form input { min-width: 80%; } form button { width: 100%; }.folder-name { display: none; }.people-heading { display: grid; gap: 8px; }.people-heading p { text-align: left; }.gallery { grid-template-columns: repeat(2, 1fr); gap: 10px; } }

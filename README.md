@@ -1,6 +1,6 @@
 # Local Lens
 
-一個以 Tauri 2、React 與 Rust 製作的 Windows 本機圖片搜尋 MVP。照片會在使用者選擇的資料夾中讀取，縮圖與暫存索引只保留在應用程式記憶體；不會上傳圖片。
+一個以 Tauri 2、React 與 Rust 製作的 Windows 本機圖片搜尋 MVP。照片會在使用者選擇的資料夾中讀取，縮圖與暫存索引只保留在應用程式記憶體；人物姓名與代表向量保存在 app-data，所有資料都不會上傳。
 
 ## 已完成的 MVP
 
@@ -9,6 +9,7 @@
 - 依檔名搜尋，支援多個關鍵字的結果排序
 - 若系統可找到 Tesseract，建立索引時會抽取 OCR 文字並納入搜尋
 - 若 FastEmbed 模型可用，建立索引時會產生 CLIP 圖片向量，支援自然語言語意搜尋
+- 使用 SCRFD 偵測人臉、ArcFace 產生 512 維身份向量，自動分群並讓使用者標記姓名
 - 格狀預覽、圖片尺寸與雙擊於檔案總管開啟原圖
 - 預留 `ocr_text`、`people`、`score` 欄位，讓 OCR、人臉辨識及語意搜尋共用同一個索引介面
 - Tauri capability 僅開啟對話框與開啟檔案功能；掃描在 Rust 命令端執行
@@ -55,7 +56,7 @@ npm run tauri build
 1. 增加 SQLite：保存路徑、檔案修改時間、縮圖快取與索引版本，讓重新開啟應用後不用重掃。
 2. 將目前記憶體內的 OCR 結果移入 SQLite，並加上 SQLite FTS5 文字索引。
 3. 將目前記憶體內的圖片向量移入 SQLite／sqlite-vec，避免重新掃描時重建模型向量。
-4. 人臉偵測、特徵向量與「待確認的人臉」畫面；僅在使用者確認後才把臉標記為姓名。
+4. 將人臉實例與群組移入 SQLite，加入拆分／合併誤判群組與一次清除全部人物資料的管理畫面。
 
 ## Semantic Search
 
@@ -72,4 +73,16 @@ npm run tauri dev
 
 建立索引與第一次搜尋都在 Rust 背景工作執行，模型下載或載入時視窗仍可回應；首次使用需要網路，之後可離線使用已快取的模型。
 
-注意：人臉向量屬敏感資料。正式版應提供清除人物資料、重新建立索引、關閉人臉功能，並在使用前明確告知使用者。
+## Face Recognition
+
+Face Recognition 使用本機 ONNX Runtime 執行 SCRFD 偵測器與 ArcFace／MobileFaceNet 辨識器；Rust 前後處理流程依 InsightFace 模型格式實作。首次建立索引時會從 `WePrompt/buffalo_sc` 下載約 16 MB 的兩個 ONNX 模型，之後從 app-data 快取離線載入。每張臉會經五點定位與對齊後產生 512 維向量，cosine similarity 達到 `0.45` 才會歸入同一人物群組。
+
+在「標記人物」輸入姓名並儲存後，姓名與該群組的代表向量會寫入 app-data 的 `people.json`；下次重新掃描時會自動辨識已標記人物。將姓名清空再儲存即可移除該人物標記。若要使用自行取得授權的模型，可設定：
+
+```powershell
+$env:LOCAL_LENS_FACE_DETECTOR = "D:\models\det_500m.onnx"
+$env:LOCAL_LENS_FACE_RECOGNIZER = "D:\models\w600k_mbf.onnx"
+npm run tauri dev
+```
+
+注意：人臉向量屬敏感生物特徵資料。此版本只保存在本機；若要商業散布，仍應確認所選預訓練模型的資料集與權利條款，並加入一次清除全部人物資料及關閉人臉功能的設定。
