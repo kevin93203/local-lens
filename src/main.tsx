@@ -11,6 +11,7 @@ type ImageRecord = {
   path: string;
   filename: string;
   modified_at: string;
+  captured_at: string | null;
   width?: number;
   height?: number;
   thumbnail: string;
@@ -336,6 +337,7 @@ function App() {
                 <div className="card-info">
                   <strong>{image.filename}</strong>
                   <span>{image.width && image.height ? `${image.width} × ${image.height}` : "圖片"}</span>
+                  {image.captured_at && <span>拍攝：{image.captured_at}</span>}
                   {image.people.length > 0 && <small>{image.people.join("、")}</small>}
                   {image.ocr_text && <small className="ocr-text" title={image.ocr_text}>OCR：{image.ocr_text.slice(0, 100)}</small>}
                 </div>

@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     hash::{Hash, Hasher},
+    io::BufReader,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex, OnceLock},
@@ -17,6 +18,7 @@ use fastembed::{
 };
 use hf_hub::api::sync::ApiBuilder;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageFormat};
+use exif::{In, Reader as ExifReader, Tag};
 #[cfg(windows)]
 use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
 use serde::{Deserialize, Serialize};
@@ -86,6 +88,7 @@ struct ImageRecord {
     path: String,
     filename: String,
     modified_at: String,
+    captured_at: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     thumbnail: String,
@@ -103,6 +106,8 @@ struct ImageRecord {
 struct CachedImageRecord {
     filename: String,
     modified_at: String,
+    #[serde(default)]
+    captured_at: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     thumbnail: String,
@@ -117,6 +122,7 @@ impl CachedImageRecord {
         Self {
             filename: record.filename.clone(),
             modified_at: record.modified_at.clone(),
+            captured_at: record.captured_at.clone(),
             width: record.width,
             height: record.height,
             thumbnail: record.thumbnail.clone(),
@@ -133,6 +139,7 @@ impl CachedImageRecord {
             path,
             filename: self.filename,
             modified_at: self.modified_at,
+            captured_at: self.captured_at,
             width: self.width,
             height: self.height,
             thumbnail: self.thumbnail,
@@ -513,6 +520,7 @@ fn open_index_cache(path: &Path) -> Result<Connection, String> {
                 path TEXT PRIMARY KEY NOT NULL,
                 bytes INTEGER NOT NULL,
                 modified_ns TEXT NOT NULL,
+                captured_at TEXT,
                 record_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS image_cache_root ON image_cache(root);
@@ -523,6 +531,10 @@ fn open_index_cache(path: &Path) -> Result<Connection, String> {
             ",
         )
         .map_err(|error| format!("無法初始化 SQLite 索引快取：{error}"))?;
+    // Existing installations were created before EXIF capture time was added.
+    // SQLite has no IF NOT EXISTS form for ADD COLUMN, so an already-present
+    // column simply produces an ignored duplicate-column error here.
+    let _ = connection.execute("ALTER TABLE image_cache ADD COLUMN captured_at TEXT", []);
     Ok(connection)
 }
 
@@ -597,14 +609,21 @@ fn append_index_cache(
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
     {
         let mut insert = transaction
-            .prepare("INSERT INTO image_cache(root, path, bytes, modified_ns, record_json) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .prepare("INSERT INTO image_cache(root, path, bytes, modified_ns, captured_at, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
             .map_err(|error| error.to_string())?;
         for record in records {
             let Some(fingerprint) = fingerprints.get(&record.path) else { continue };
             let payload = serde_json::to_string(&CachedImageRecord::from_record(record))
                 .map_err(|error| error.to_string())?;
             insert
-                .execute(params![root, record.path, fingerprint.bytes, fingerprint.modified_ns.to_string(), payload])
+                .execute(params![
+                    root,
+                    record.path,
+                    fingerprint.bytes,
+                    fingerprint.modified_ns.to_string(),
+                    record.captured_at.as_deref(),
+                    payload
+                ])
                 .map_err(|error| error.to_string())?;
         }
     }
@@ -774,6 +793,48 @@ fn format_modified(time: SystemTime) -> String {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_default()
+}
+
+fn normalize_exif_datetime(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches('\0')
+        .trim_matches('"')
+        .trim();
+    let parts: Vec<u32> = value
+        .split(|character: char| character == ':' || character == '-' || character == ' ' || character == 'T')
+        .filter(|part| !part.is_empty())
+        .take(6)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if parts.len() != 6
+        || !(1900..=2200).contains(&parts[0])
+        || !(1..=12).contains(&parts[1])
+        || !(1..=31).contains(&parts[2])
+        || parts[3] > 23
+        || parts[4] > 59
+        || parts[5] > 60
+    {
+        return None;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+    ))
+}
+
+fn extract_exif_capture_time(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let metadata = ExifReader::new().read_from_container(&mut reader).ok()?;
+    [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime]
+        .into_iter()
+        .find_map(|tag| {
+            metadata
+                .get_field(tag, In::PRIMARY)
+                .and_then(|field| normalize_exif_datetime(&field.display_value().to_string()))
+        })
 }
 
 fn tesseract_program() -> OsString {
@@ -1175,6 +1236,7 @@ fn build_index(
                         .and_then(|metadata| metadata.modified())
                         .map(format_modified)
                         .unwrap_or_default(),
+                    captured_at: extract_exif_capture_time(path),
                     width: Some(width),
                     height: Some(height),
                     thumbnail,
@@ -1627,6 +1689,16 @@ mod tests {
     }
 
     #[test]
+    fn exif_datetime_is_normalized_for_date_queries() {
+        assert_eq!(
+            normalize_exif_datetime("2025:07:01 12:34:56"),
+            Some("2025-07-01 12:34:56".to_owned())
+        );
+        assert_eq!(normalize_exif_datetime("not-a-date"), None);
+        assert_eq!(normalize_exif_datetime("2025:13:01 12:34:56"), None);
+    }
+
+    #[test]
     fn face_embeddings_are_grouped_only_when_they_are_similar() {
         let mut clusters = Vec::new();
         let (first_id, _) = assign_face_cluster(
@@ -1689,6 +1761,7 @@ mod tests {
             path: path.clone(),
             filename: "sample.jpg".to_owned(),
             modified_at: "2026-08-19".to_owned(),
+            captured_at: Some("2025-07-01 12:34:56".to_owned()),
             width: Some(1200),
             height: Some(800),
             thumbnail: "data:image/jpeg;base64,test".to_owned(),
@@ -1711,6 +1784,10 @@ mod tests {
         let cached = load_cached_images(Some(&cache_path), root);
         let cached_record = cached.get(&path).unwrap();
         assert_eq!(cached_record.fingerprint.bytes, 42);
+        assert_eq!(
+            cached_record.record.captured_at.as_deref(),
+            Some("2025-07-01 12:34:56")
+        );
         assert_eq!(cached_record.record.ocr_text, "receipt");
         assert_eq!(cached_record.record.embedding, Some(vec![0.25, 0.75]));
         let _ = fs::remove_file(cache_path);

@@ -22,6 +22,7 @@ walkdir = "2.5"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 fast_image_resize = { version = "6.1.0", features = ["rayon"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+kamadak-exif = "0.6.1"
 base64 = "0.22"
 fastembed = { path = "../vendor/fastembed-patched" }
 hf-hub = "=0.4.3"
