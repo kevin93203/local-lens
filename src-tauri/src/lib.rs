@@ -5,7 +5,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     time::SystemTime,
 };
 
@@ -193,6 +193,13 @@ struct AppIndex {
     settings: Arc<Mutex<ModelSettings>>,
     settings_file: Arc<Mutex<Option<PathBuf>>>,
     cache_file: Arc<Mutex<Option<PathBuf>>>,
+    scan_control: Arc<ScanControl>,
+}
+
+#[derive(Default)]
+struct ScanControl {
+    paused: Mutex<bool>,
+    wake: Condvar,
 }
 
 #[derive(Serialize)]
@@ -240,6 +247,23 @@ fn is_supported_image(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .map(|extension| IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+fn set_scan_paused(control: &ScanControl, paused: bool) -> Result<(), String> {
+    let mut state = control.paused.lock().map_err(|_| "掃描控制暫時無法使用。")?;
+    *state = paused;
+    if !paused {
+        control.wake.notify_all();
+    }
+    Ok(())
+}
+
+fn wait_for_scan_resume(control: &ScanControl) -> Result<(), String> {
+    let mut paused = control.paused.lock().map_err(|_| "掃描控制暫時無法使用。")?;
+    while *paused {
+        paused = control.wake.wait(paused).map_err(|_| "掃描控制暫時無法使用。")?;
+    }
+    Ok(())
 }
 
 fn thumbnail_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -1001,6 +1025,7 @@ fn build_index(
     )
     .map_err(|error| error.to_string())?;
     for (position, path) in candidates.iter().enumerate() {
+        wait_for_scan_resume(&index.scan_control)?;
         let path_text = path.to_string_lossy().into_owned();
         if let (Some(current), Some(cached)) = (fingerprints.get(&path_text), cached_images.get(&path_text)) {
             if current.bytes == cached.fingerprint.bytes && current.modified_ns == cached.fingerprint.modified_ns {
@@ -1183,12 +1208,23 @@ async fn scan_folder(
     app: tauri::AppHandle,
     index: State<'_, AppIndex>,
 ) -> Result<ScanResult, String> {
+    set_scan_paused(&index.scan_control, false)?;
     let index = index.inner().clone();
     // Decoding images and encoding thumbnails are CPU / disk heavy.  Use a
     // blocking worker so the WebView and native window keep processing events.
     tauri::async_runtime::spawn_blocking(move || build_index(folder, app, index))
         .await
         .map_err(|error| format!("索引工作意外中止：{error}"))?
+}
+
+#[tauri::command]
+fn pause_scan(index: State<'_, AppIndex>) -> Result<(), String> {
+    set_scan_paused(&index.scan_control, true)
+}
+
+#[tauri::command]
+fn resume_scan(index: State<'_, AppIndex>) -> Result<(), String> {
+    set_scan_paused(&index.scan_control, false)
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -1652,6 +1688,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_folder,
+            pause_scan,
+            resume_scan,
             search_images,
             get_model_settings,
             update_model_settings,

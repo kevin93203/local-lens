@@ -34,6 +34,7 @@ function App() {
   const [status, setStatus] = useState("選擇一個照片資料夾來建立本機索引。");
   const [busy, setBusy] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [scanPaused, setScanPaused] = useState(false);
   const [peopleOnly, setPeopleOnly] = useState(false);
   const [faceGroups, setFaceGroups] = useState<FaceGroup[]>([]);
   const [faceNames, setFaceNames] = useState<Record<string, string>>({});
@@ -61,6 +62,7 @@ function App() {
 
   async function saveModelSettings() {
     setBusy(true);
+    setScanPaused(false);
     try {
       const info = await invoke<SettingsInfo>("update_model_settings", { settings: settingsDraft });
       setSettingsInfo(info);
@@ -101,6 +103,23 @@ function App() {
     } finally {
       setBusy(false);
       setScanProgress(null);
+      setScanPaused(false);
+    }
+  }
+
+  async function toggleScanPause() {
+    try {
+      if (scanPaused) {
+        await invoke("resume_scan");
+        setScanPaused(false);
+        setStatus("已繼續建立圖片索引…");
+      } else {
+        await invoke("pause_scan");
+        setScanPaused(true);
+        setStatus("建立圖片索引已暫停；可隨時繼續。");
+      }
+    } catch (error) {
+      setStatus(`無法${scanPaused ? "繼續" : "暫停"}索引：${String(error)}`);
     }
   }
 
@@ -228,12 +247,23 @@ function App() {
         <section className="progress-panel" aria-live="polite">
           <div className="progress-label">
             <span>正在建立圖片索引</span>
-            <span>{scanProgress.total ? `${scanProgress.processed} / ${scanProgress.total}` : "正在統計圖片…"}</span>
+            <span>{scanPaused ? "已暫停" : (scanProgress.total ? `${scanProgress.processed} / ${scanProgress.total}` : "正在統計圖片…")}</span>
           </div>
           <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={scanProgress.total || undefined} aria-valuenow={scanProgress.processed}>
             <div className="progress-fill" style={{ width: scanProgress.total ? `${Math.round((scanProgress.processed / scanProgress.total) * 100)}%` : "3%" }} />
           </div>
           <p>已建立 {scanProgress.indexed} 張縮圖{scanProgress.reused ? `（重用 ${scanProgress.reused} 筆 SQLite 快取）` : ""}{scanProgress.thumbnail_gpu_requested ? `（${scanProgress.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : ""}；{scanProgress.ocr_available ? `同步進行 OCR${scanProgress.ocr_gpu_requested ? `（${scanProgress.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "OCR 未啟用"}；{scanProgress.semantic_available ? `同步建立語意向量${scanProgress.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒"}；{scanProgress.face_available ? `已偵測 ${scanProgress.faces_detected} 張臉${scanProgress.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}{scanProgress.skipped ? `；略過 ${scanProgress.skipped} 個無法讀取的檔案` : ""}{scanProgress.gpu_warning ? `；⚠ ${scanProgress.gpu_warning}` : ""}。</p>
+          <button
+            className={`scan-control-button ${scanPaused ? "resume" : "pause"}`}
+            type="button"
+            onClick={() => void toggleScanPause()}
+            aria-label={scanPaused ? "繼續索引" : "暫停索引"}
+          >
+            <svg className="scan-control-icon" viewBox="0 0 24 24" aria-hidden="true">
+              {scanPaused ? <path d="M8 5.5v13l10-6.5z" /> : <><rect x="6" y="5" width="4.5" height="14" rx="1" /><rect x="13.5" y="5" width="4.5" height="14" rx="1" /></>}
+            </svg>
+            <span>{scanPaused ? "繼續索引" : "暫停索引"}</span>
+          </button>
         </section>
       )}
 
