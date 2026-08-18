@@ -16,6 +16,8 @@ use fastembed::{
 };
 use hf_hub::api::sync::ApiBuilder;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageFormat};
+#[cfg(windows)]
+use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
@@ -32,9 +34,40 @@ const SEMANTIC_BEST_MARGIN: f32 = 0.07;
 const FACE_MATCH_THRESHOLD: f32 = 0.45;
 const FACE_MODEL_REPOSITORY: &str = "WePrompt/buffalo_sc";
 
+struct CachedTextModel {
+    requested_gpu: bool,
+    model: TextEmbedding,
+}
+
 // Keep the text encoder alive after its first use. Loading the ONNX session
 // for every keystroke/search would make subsequent searches unnecessarily slow.
-static TEXT_MODEL: OnceLock<Mutex<Option<TextEmbedding>>> = OnceLock::new();
+static TEXT_MODEL: OnceLock<Mutex<Option<CachedTextModel>>> = OnceLock::new();
+static DIRECTML_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct ModelSettings {
+    ocr_gpu: bool,
+    clip_gpu: bool,
+    face_gpu: bool,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            ocr_gpu: false,
+            clip_gpu: false,
+            face_gpu: false,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SettingsInfo {
+    settings: ModelSettings,
+    directml_available: bool,
+    ocr_gpu_experimental: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct ImageRecord {
@@ -91,6 +124,8 @@ struct IndexData {
 struct AppIndex {
     data: Arc<Mutex<IndexData>>,
     people_file: Arc<Mutex<Option<PathBuf>>>,
+    settings: Arc<Mutex<ModelSettings>>,
+    settings_file: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +138,9 @@ struct ScanResult {
     face_available: bool,
     faces_detected: usize,
     face_groups: usize,
+    clip_gpu_active: bool,
+    face_gpu_active: bool,
+    ocr_gpu_requested: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -115,6 +153,9 @@ struct ScanProgress {
     semantic_available: bool,
     face_available: bool,
     faces_detected: usize,
+    clip_gpu_active: bool,
+    face_gpu_active: bool,
+    ocr_gpu_requested: bool,
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -139,7 +180,50 @@ fn make_thumbnail(path: &Path) -> Result<(String, u32, u32), String> {
     ))
 }
 
-fn load_face_engine() -> Result<FaceEngine, String> {
+fn clip_execution_providers(use_gpu: bool) -> Vec<fastembed::ExecutionProviderDispatch> {
+    #[cfg(windows)]
+    if use_gpu {
+        return vec![DirectMLExecutionProvider::default()
+            .build()
+            .error_on_failure()];
+    }
+    let _ = use_gpu;
+    Vec::new()
+}
+
+fn directml_available() -> bool {
+    *DIRECTML_AVAILABLE.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            return DirectMLExecutionProvider::default()
+                .is_available()
+                .unwrap_or(false);
+        }
+        #[allow(unreachable_code)]
+        false
+    })
+}
+
+fn load_image_embedding(use_gpu: bool) -> (Option<ImageEmbedding>, bool) {
+    if use_gpu {
+        let options = ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32)
+            .with_execution_providers(clip_execution_providers(true))
+            .with_show_download_progress(false);
+        if let Ok(model) = ImageEmbedding::try_new(options) {
+            return (Some(model), true);
+        }
+    }
+    (
+        ImageEmbedding::try_new(
+            ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32)
+                .with_show_download_progress(false),
+        )
+        .ok(),
+        false,
+    )
+}
+
+fn load_face_engine(use_gpu: bool) -> Result<(FaceEngine, bool), String> {
     let detector_override = std::env::var_os("LOCAL_LENS_FACE_DETECTOR").map(PathBuf::from);
     let recognizer_override = std::env::var_os("LOCAL_LENS_FACE_RECOGNIZER").map(PathBuf::from);
     let (detector_path, recognizer_path) = match (detector_override, recognizer_override) {
@@ -165,7 +249,13 @@ fn load_face_engine() -> Result<FaceEngine, String> {
             (detector, recognizer)
         }
     };
-    FaceEngine::new(detector_path, recognizer_path)
+    if use_gpu {
+        if let Ok(engine) = FaceEngine::new(&detector_path, &recognizer_path, true) {
+            return Ok((engine, true));
+        }
+    }
+    FaceEngine::new(detector_path, recognizer_path, false)
+        .map(|engine| (engine, false))
         .map_err(|error| format!("無法載入人臉模型：{error}"))
 }
 
@@ -210,6 +300,33 @@ fn make_face_thumbnail(image: &image::DynamicImage, face: &Face) -> Option<Strin
 
 fn people_file(index: &AppIndex) -> Option<PathBuf> {
     index.people_file.lock().ok()?.clone()
+}
+
+fn settings_file(index: &AppIndex) -> Option<PathBuf> {
+    index.settings_file.lock().ok()?.clone()
+}
+
+fn current_settings(index: &AppIndex) -> ModelSettings {
+    index
+        .settings
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default()
+}
+
+fn load_settings(path: &Path) -> ModelSettings {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(path: &Path, settings: &ModelSettings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?;
+    fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 fn load_known_people(index: &AppIndex) -> Vec<KnownPerson> {
@@ -373,8 +490,10 @@ fn run_tesseract(
     program: &OsString,
     language: &OsString,
     page_segmentation_mode: u8,
+    use_gpu: bool,
 ) -> Option<OcrCandidate> {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg(path)
         .arg("stdout")
         .arg("--oem")
@@ -387,9 +506,13 @@ fn run_tesseract(
         .arg("user_defined_dpi=300")
         .arg("-c")
         .arg("preserve_interword_spaces=1")
-        .arg("tsv")
-        .output()
-        .ok()?;
+        .arg("tsv");
+    if use_gpu {
+        // This is honored only by a Tesseract build compiled with its
+        // experimental OpenCL backend. Standard builds safely ignore it.
+        command.env("TESSERACT_OPENCL_DEVICE", "1");
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -433,17 +556,18 @@ fn run_tesseract(
     })
 }
 
-fn extract_ocr_text(path: &Path, program: &OsString) -> String {
+fn extract_ocr_text(path: &Path, program: &OsString, use_gpu: bool) -> String {
     let enhanced_path = make_ocr_image(path);
     let enhanced = enhanced_path.as_deref().unwrap_or(path);
     let configured_language = tesseract_language();
     let english = OsString::from("eng");
     let mut candidates = Vec::new();
     for (input, mode) in [(enhanced, 6_u8), (path, 11_u8)] {
-        if let Some(candidate) = run_tesseract(input, program, &configured_language, mode) {
+        if let Some(candidate) = run_tesseract(input, program, &configured_language, mode, use_gpu)
+        {
             candidates.push(candidate);
         } else if configured_language != english {
-            if let Some(candidate) = run_tesseract(input, program, &english, mode) {
+            if let Some(candidate) = run_tesseract(input, program, &english, mode, use_gpu) {
                 candidates.push(candidate);
             }
         }
@@ -487,16 +611,20 @@ fn build_index(
     let known_people = load_known_people(&index);
     let mut faces_detected = 0;
     let mut skipped = 0;
+    let settings = current_settings(&index);
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
     // The first initialization may download the local ONNX models into the
     // FastEmbed cache. It runs inside the blocking worker, never on the UI loop.
-    let mut image_model = ImageEmbedding::try_new(
-        ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32).with_show_download_progress(false),
-    )
-    .ok();
+    let gpu_available = directml_available();
+    let (mut image_model, clip_gpu_active) =
+        load_image_embedding(settings.clip_gpu && gpu_available);
     let mut semantic_available = image_model.is_some();
-    let mut face_engine = load_face_engine().ok();
+    let (mut face_engine, face_gpu_active) =
+        match load_face_engine(settings.face_gpu && gpu_available) {
+            Ok((engine, active)) => (Some(engine), active),
+            Err(_) => (None, false),
+        };
     let face_available = face_engine.is_some();
     app.emit(
         "scan-progress",
@@ -509,6 +637,9 @@ fn build_index(
             semantic_available,
             face_available,
             faces_detected,
+            clip_gpu_active,
+            face_gpu_active,
+            ocr_gpu_requested: settings.ocr_gpu,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -581,7 +712,7 @@ fn build_index(
                     height: Some(height),
                     thumbnail,
                     ocr_text: if ocr_available {
-                        extract_ocr_text(path, &ocr_program)
+                        extract_ocr_text(path, &ocr_program, settings.ocr_gpu)
                     } else {
                         String::new()
                     },
@@ -607,6 +738,9 @@ fn build_index(
                     semantic_available,
                     face_available,
                     faces_detected,
+                    clip_gpu_active,
+                    face_gpu_active,
+                    ocr_gpu_requested: settings.ocr_gpu,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -628,6 +762,9 @@ fn build_index(
         face_available,
         faces_detected,
         face_groups,
+        clip_gpu_active,
+        face_gpu_active,
+        ocr_gpu_requested: settings.ocr_gpu,
     })
 }
 
@@ -664,24 +801,47 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     }
 }
 
-fn embed_queries(query: &str) -> Vec<Vec<f32>> {
+fn embed_queries(query: &str, use_gpu: bool) -> Vec<Vec<f32>> {
     let model_lock = TEXT_MODEL.get_or_init(|| Mutex::new(None));
     let Ok(mut model) = model_lock.lock() else {
         return Vec::new();
     };
-    if model.is_none() {
-        *model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::ClipVitB32).with_show_download_progress(false),
-        )
-        .ok();
+    if model
+        .as_ref()
+        .is_some_and(|cached| cached.requested_gpu != use_gpu)
+    {
+        *model = None;
     }
-    let Some(model) = model.as_mut() else {
+    if model.is_none() {
+        let gpu_model = (use_gpu && directml_available())
+            .then(|| {
+                TextEmbedding::try_new(
+                    InitOptions::new(EmbeddingModel::ClipVitB32)
+                        .with_execution_providers(clip_execution_providers(true))
+                        .with_show_download_progress(false),
+                )
+                .ok()
+            })
+            .flatten();
+        let loaded = gpu_model.or_else(|| {
+            TextEmbedding::try_new(
+                InitOptions::new(EmbeddingModel::ClipVitB32).with_show_download_progress(false),
+            )
+            .ok()
+        });
+        *model = loaded.map(|model| CachedTextModel {
+            requested_gpu: use_gpu,
+            model,
+        });
+    }
+    let Some(cached) = model.as_mut() else {
         return Vec::new();
     };
     // CLIP was trained with short image captions. Comparing both the user's
     // original wording and a photo-oriented prompt is more stable for natural
     // language queries than relying on only one phrasing.
-    model
+    cached
+        .model
         .embed(
             vec![query.to_owned(), format!("a photo of {query}")],
             Some(2),
@@ -696,6 +856,7 @@ fn semantic_threshold(best_score: Option<f32>) -> f32 {
 }
 
 fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>, String> {
+    let settings = current_settings(&index);
     let normalized_query = query.to_lowercase();
     let terms: Vec<String> = normalized_query
         .split(|character: char| {
@@ -714,7 +875,7 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
         return Ok(records.iter().take(MAX_BROWSE_RESULTS).cloned().collect());
     }
     let query_embeddings = if records.iter().any(|record| record.embedding.is_some()) {
-        embed_queries(&query)
+        embed_queries(&query, settings.clip_gpu)
     } else {
         Vec::new()
     };
@@ -819,6 +980,47 @@ async fn search_images(
     tauri::async_runtime::spawn_blocking(move || search_images_sync(query, index))
         .await
         .map_err(|error| format!("搜尋工作意外中止：{error}"))?
+}
+
+#[tauri::command]
+fn get_model_settings(index: State<'_, AppIndex>) -> SettingsInfo {
+    SettingsInfo {
+        settings: current_settings(index.inner()),
+        directml_available: directml_available(),
+        ocr_gpu_experimental: true,
+    }
+}
+
+#[tauri::command]
+fn update_model_settings(
+    settings: ModelSettings,
+    index: State<'_, AppIndex>,
+) -> Result<SettingsInfo, String> {
+    if let Some(path) = settings_file(index.inner()) {
+        save_settings(&path, &settings)?;
+    }
+    let changed_clip_backend = index
+        .settings
+        .lock()
+        .map_err(|_| "模型設定暫時無法使用。")?
+        .clip_gpu
+        != settings.clip_gpu;
+    *index
+        .settings
+        .lock()
+        .map_err(|_| "模型設定暫時無法使用。")? = settings.clone();
+    if changed_clip_backend {
+        if let Some(model_lock) = TEXT_MODEL.get() {
+            if let Ok(mut model) = model_lock.lock() {
+                *model = None;
+            }
+        }
+    }
+    Ok(SettingsInfo {
+        settings,
+        directml_available: directml_available(),
+        ocr_gpu_experimental: true,
+    })
 }
 
 #[tauri::command]
@@ -934,6 +1136,20 @@ mod tests {
         assert_eq!(clusters[0].face_count, 2);
         assert_eq!(clusters[0].image_ids.len(), 2);
     }
+
+    #[test]
+    fn model_settings_are_backward_compatible() {
+        let settings: ModelSettings = serde_json::from_str(r#"{"clip_gpu":true}"#).unwrap();
+        assert!(settings.clip_gpu);
+        assert!(!settings.face_gpu);
+        assert!(!settings.ocr_gpu);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directml_capability_probe_is_safe() {
+        let _ = directml_available();
+    }
 }
 
 pub fn run() {
@@ -956,12 +1172,22 @@ pub fn run() {
                 if let Ok(mut people_file) = index.people_file.lock() {
                     *people_file = Some(app_data.join("people.json"));
                 };
+                let model_settings_file = app_data.join("settings.json");
+                let model_settings = load_settings(&model_settings_file);
+                if let Ok(mut settings) = index.settings.lock() {
+                    *settings = model_settings;
+                }
+                if let Ok(mut settings_file) = index.settings_file.lock() {
+                    *settings_file = Some(model_settings_file);
+                };
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             scan_folder,
             search_images,
+            get_model_settings,
+            update_model_settings,
             list_face_groups,
             label_face_group
         ])

@@ -31,3 +31,6 @@ nalgebra = "=0.35.0"
 # the project.  Newer `time` releases use the Rust 2024 edition (Cargo 1.85+).
 # This can be removed after upgrading the Rust toolchain.
 time = "=0.3.36"
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "download-binaries", "directml"] }

@@ -4,6 +4,8 @@ use image::{imageops, Rgb, RgbImage};
 use imageproc::geometric_transformations::{warp_into, Border, Interpolation, Projection};
 use nalgebra::{Matrix2, Matrix2x3, Vector2};
 use ndarray::Array4;
+#[cfg(windows)]
+use ort::execution_providers::DirectMLExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 
 const DETECTOR_SIZE: u32 = 640;
@@ -69,18 +71,19 @@ impl FaceEngine {
     pub fn new(
         detector_path: impl AsRef<Path>,
         recognizer_path: impl AsRef<Path>,
+        use_gpu: bool,
     ) -> Result<Self, String> {
         // Keep one CPU available for the WebView and cap inference parallelism so
         // indexing a large folder does not make the desktop UI feel unresponsive.
         let threads = available_parallelism()
             .map(|count| count.get().saturating_sub(1).clamp(1, 4))
             .unwrap_or(1);
-        let detector = Session::builder()
+        let detector = configure_session(Session::builder(), use_gpu)
             .and_then(|builder| builder.with_optimization_level(GraphOptimizationLevel::Level3))
             .and_then(|builder| builder.with_intra_threads(threads))
             .and_then(|builder| builder.commit_from_file(detector_path))
             .map_err(|error| error.to_string())?;
-        let recognizer = Session::builder()
+        let recognizer = configure_session(Session::builder(), use_gpu)
             .and_then(|builder| builder.with_optimization_level(GraphOptimizationLevel::Level3))
             .and_then(|builder| builder.with_intra_threads(threads))
             .and_then(|builder| builder.commit_from_file(recognizer_path))
@@ -257,6 +260,26 @@ impl FaceEngine {
         }
         Ok(embedding)
     }
+}
+
+fn configure_session(
+    builder: ort::Result<ort::session::builder::SessionBuilder>,
+    use_gpu: bool,
+) -> ort::Result<ort::session::builder::SessionBuilder> {
+    let builder = builder?;
+    #[cfg(windows)]
+    if use_gpu {
+        // DirectML requires sequential execution and memory patterns disabled.
+        // Unsupported nodes automatically fall back to ONNX Runtime's CPU EP.
+        return builder
+            .with_memory_pattern(false)?
+            .with_parallel_execution(false)?
+            .with_execution_providers([DirectMLExecutionProvider::default()
+                .build()
+                .error_on_failure()]);
+    }
+    let _ = use_gpu;
+    Ok(builder)
 }
 
 fn estimate_similarity_transform(

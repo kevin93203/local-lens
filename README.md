@@ -10,6 +10,7 @@
 - 若系統可找到 Tesseract，建立索引時會抽取 OCR 文字並納入搜尋
 - 若 FastEmbed 模型可用，建立索引時會產生 CLIP 圖片向量，支援自然語言語意搜尋
 - 使用 SCRFD 偵測人臉、ArcFace 產生 512 維身份向量，自動分群並讓使用者標記姓名
+- 在設定中分別控制 CLIP、Face 的 DirectML GPU 加速及 Tesseract OCR 的實驗性 OpenCL 請求
 - 格狀預覽、圖片尺寸與雙擊於檔案總管開啟原圖
 - 預留 `ocr_text`、`people`、`score` 欄位，讓 OCR、人臉辨識及語意搜尋共用同一個索引介面
 - Tauri capability 僅開啟對話框與開啟檔案功能；掃描在 Rust 命令端執行
@@ -72,6 +73,15 @@ npm run tauri dev
 ```
 
 建立索引與第一次搜尋都在 Rust 背景工作執行，模型下載或載入時視窗仍可回應；首次使用需要網路，之後可離線使用已快取的模型。
+
+## GPU 加速設定
+
+按右上角「設定」可分別啟用 CLIP、Face 與 OCR 的 GPU 選項。CLIP 與 Face 在 Windows 使用 ONNX Runtime DirectML，可支援具備 DirectX 12 的 NVIDIA、AMD 與 Intel GPU；若 DirectML 無法註冊或模型工作階段無法建立，應用程式會自動退回 CPU，並在建立索引進度與完成訊息顯示實際後端。設定保存在 app-data 的 `settings.json`，變更後需要重新選擇照片資料夾以重建索引。
+
+OCR 仍使用外部 Tesseract。勾選「OCR OpenCL（實驗性）」會為 Tesseract 子程序設定 `TESSERACT_OPENCL_DEVICE=1`，但只有自行編譯且啟用 OpenCL 的 Tesseract 才會使用 GPU；官方不建議一般使用者依賴這項實驗性功能，而且它不一定比 CPU 快。標準 Windows 安裝版通常仍會使用 CPU。
+
+- [ONNX Runtime DirectML 說明](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html)
+- [Tesseract OpenCL 說明](https://github.com/tesseract-ocr/tessdoc/blob/main/TesseractOpenCL.md)
 
 ## Face Recognition
 
