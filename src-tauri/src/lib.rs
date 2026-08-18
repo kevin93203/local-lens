@@ -42,7 +42,7 @@ struct CachedTextModel {
 // Keep the text encoder alive after its first use. Loading the ONNX session
 // for every keystroke/search would make subsequent searches unnecessarily slow.
 static TEXT_MODEL: OnceLock<Mutex<Option<CachedTextModel>>> = OnceLock::new();
-static DIRECTML_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static DIRECTML_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -68,6 +68,8 @@ impl Default for ModelSettings {
 struct SettingsInfo {
     settings: ModelSettings,
     directml_available: bool,
+    directml_error: Option<String>,
+    thumbnail_gpu_available: bool,
     ocr_gpu_experimental: bool,
 }
 
@@ -143,7 +145,9 @@ struct ScanResult {
     clip_gpu_active: bool,
     face_gpu_active: bool,
     thumbnail_gpu_requested: bool,
+    thumbnail_gpu_active: bool,
     ocr_gpu_requested: bool,
+    ocr_gpu_active: bool,
     gpu_warning: Option<String>,
 }
 
@@ -160,7 +164,9 @@ struct ScanProgress {
     clip_gpu_active: bool,
     face_gpu_active: bool,
     thumbnail_gpu_requested: bool,
+    thumbnail_gpu_active: bool,
     ocr_gpu_requested: bool,
+    ocr_gpu_active: bool,
     gpu_warning: Option<String>,
 }
 
@@ -202,16 +208,31 @@ fn clip_execution_providers(use_gpu: bool) -> Vec<fastembed::ExecutionProviderDi
 }
 
 fn directml_available() -> bool {
-    *DIRECTML_AVAILABLE.get_or_init(|| {
+    directml_status().is_ok()
+}
+
+fn directml_status() -> Result<(), String> {
+    DIRECTML_STATUS
+        .get_or_init(|| {
         #[cfg(windows)]
         {
             return DirectMLExecutionProvider::default()
                 .is_available()
-                .unwrap_or(false);
+                .map_err(|error| format!("無法列舉 ONNX Runtime 執行後端：{error}"))
+                .and_then(|available| {
+                    available.then_some(()).ok_or_else(|| {
+                        "目前載入的 ONNX Runtime 沒有 DirectML 執行後端".to_owned()
+                    })
+                });
         }
         #[allow(unreachable_code)]
-        false
-    })
+        Err("DirectML 僅支援 Windows".to_owned())
+        })
+        .clone()
+}
+
+fn directml_error() -> Option<String> {
+    directml_status().err()
 }
 
 fn load_image_embedding(use_gpu: bool) -> (Option<ImageEmbedding>, bool, Option<String>) {
@@ -466,6 +487,23 @@ fn has_tesseract(program: &OsString) -> bool {
         .unwrap_or(false)
 }
 
+fn tesseract_opencl_available(program: &OsString) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            let details = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            details.to_ascii_lowercase().contains("opencl")
+        })
+        .unwrap_or(false)
+}
+
 struct OcrCandidate {
     text: String,
     confidence: f32,
@@ -625,16 +663,24 @@ fn build_index(
     let settings = current_settings(&index);
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
+    let ocr_gpu_active = settings.ocr_gpu && ocr_available && tesseract_opencl_available(&ocr_program);
     // The first initialization may download the local ONNX models into the
     // FastEmbed cache. It runs inside the blocking worker, never on the UI loop.
     let gpu_available = directml_available();
     let mut gpu_warnings = Vec::new();
+    if settings.thumbnail_gpu {
+        gpu_warnings.push("縮圖 GPU：目前影像解碼、縮放與 JPEG 編碼仍由 CPU 執行；此選項尚無可用的 GPU 後端".to_owned());
+    }
+    if settings.ocr_gpu && !ocr_gpu_active {
+        gpu_warnings.push("OCR GPU：目前 Tesseract 未回報 OpenCL 支援，已使用 CPU".to_owned());
+    }
     if !gpu_available {
+        let reason = directml_error().unwrap_or_else(|| "找不到可用的 DirectML".to_owned());
         if settings.clip_gpu {
-            gpu_warnings.push("CLIP GPU：找不到可用的 DirectML，已使用 CPU".to_owned());
+            gpu_warnings.push(format!("CLIP GPU：{reason}，已使用 CPU"));
         }
         if settings.face_gpu {
-            gpu_warnings.push("Face GPU：找不到可用的 DirectML，已使用 CPU".to_owned());
+            gpu_warnings.push(format!("Face GPU：{reason}，已使用 CPU"));
         }
     }
     let (mut image_model, clip_gpu_active, clip_gpu_error) =
@@ -667,7 +713,9 @@ fn build_index(
             clip_gpu_active,
             face_gpu_active,
             thumbnail_gpu_requested: settings.thumbnail_gpu,
+            thumbnail_gpu_active: false,
             ocr_gpu_requested: settings.ocr_gpu,
+            ocr_gpu_active,
             gpu_warning: gpu_warning.clone(),
         },
     )
@@ -770,7 +818,9 @@ fn build_index(
                     clip_gpu_active,
                     face_gpu_active,
                     thumbnail_gpu_requested: settings.thumbnail_gpu,
+                    thumbnail_gpu_active: false,
                     ocr_gpu_requested: settings.ocr_gpu,
+                    ocr_gpu_active,
                     gpu_warning: gpu_warning.clone(),
                 },
             )
@@ -796,7 +846,9 @@ fn build_index(
         clip_gpu_active,
         face_gpu_active,
         thumbnail_gpu_requested: settings.thumbnail_gpu,
+        thumbnail_gpu_active: false,
         ocr_gpu_requested: settings.ocr_gpu,
+        ocr_gpu_active,
         gpu_warning,
     })
 }
@@ -1020,6 +1072,8 @@ fn get_model_settings(index: State<'_, AppIndex>) -> SettingsInfo {
     SettingsInfo {
         settings: current_settings(index.inner()),
         directml_available: directml_available(),
+        directml_error: directml_error(),
+        thumbnail_gpu_available: false,
         ocr_gpu_experimental: true,
     }
 }
@@ -1052,6 +1106,8 @@ fn update_model_settings(
     Ok(SettingsInfo {
         settings,
         directml_available: directml_available(),
+        directml_error: directml_error(),
+        thumbnail_gpu_available: false,
         ocr_gpu_experimental: true,
     })
 }
