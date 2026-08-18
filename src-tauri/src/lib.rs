@@ -29,6 +29,7 @@ use face::{Face, FaceEngine};
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const DEFAULT_MAX_INDEXED_IMAGES: usize = 3_000;
+const DEFAULT_INDEX_BATCH_SIZE: usize = 50;
 const MAX_BROWSE_RESULTS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 60;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
@@ -50,6 +51,7 @@ static DIRECTML_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
 #[serde(default)]
 struct ModelSettings {
     max_indexed_images: Option<usize>,
+    index_batch_size: usize,
     thumbnail_gpu: bool,
     ocr_gpu: bool,
     clip_gpu: bool,
@@ -60,6 +62,7 @@ impl Default for ModelSettings {
     fn default() -> Self {
         Self {
             max_indexed_images: Some(DEFAULT_MAX_INDEXED_IMAGES),
+            index_batch_size: DEFAULT_INDEX_BATCH_SIZE,
             thumbnail_gpu: false,
             ocr_gpu: false,
             clip_gpu: false,
@@ -558,19 +561,27 @@ fn load_cached_face_groups(path: Option<&Path>, root: &str) -> Vec<FaceCluster> 
         .unwrap_or_default()
 }
 
-fn save_index_cache(
+fn reset_index_cache(path: Option<&Path>, root: &str) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let connection = open_index_cache(path)?;
+    connection
+        .execute("DELETE FROM image_cache WHERE root = ?1", params![root])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM scan_state WHERE root = ?1", params![root])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn append_index_cache(
     path: Option<&Path>,
     root: &str,
     records: &[ImageRecord],
     fingerprints: &HashMap<String, FileFingerprint>,
-    face_groups: &[FaceCluster],
 ) -> Result<(), String> {
     let Some(path) = path else { return Ok(()) };
     let mut connection = open_index_cache(path)?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
-    transaction
-        .execute("DELETE FROM image_cache WHERE root = ?1", params![root])
-        .map_err(|error| error.to_string())?;
     {
         let mut insert = transaction
             .prepare("INSERT INTO image_cache(root, path, bytes, modified_ns, record_json) VALUES (?1, ?2, ?3, ?4, ?5)")
@@ -584,15 +595,25 @@ fn save_index_cache(
                 .map_err(|error| error.to_string())?;
         }
     }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn save_index_cache_state(
+    path: Option<&Path>,
+    root: &str,
+    face_groups: &[FaceCluster],
+) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let connection = open_index_cache(path)?;
     let face_groups_json = serde_json::to_string(face_groups).map_err(|error| error.to_string())?;
-    transaction
+    connection
         .execute(
             "INSERT INTO scan_state(root, face_groups_json) VALUES (?1, ?2) \
              ON CONFLICT(root) DO UPDATE SET face_groups_json = excluded.face_groups_json",
             params![root, face_groups_json],
         )
         .map_err(|error| error.to_string())?;
-    transaction.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn refresh_face_cluster_counts(face_clusters: &mut Vec<FaceCluster>, records: &[ImageRecord]) {
@@ -957,6 +978,9 @@ fn build_index(
     let mut faces_detected = 0;
     let mut skipped = 0;
     let settings = current_settings(&index);
+    let _ = reset_index_cache(cache_path.as_deref(), &folder);
+    let mut cache_written = 0usize;
+    let batch_size = settings.index_batch_size.max(1);
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
     let ocr_gpu_active = settings.ocr_gpu && ocr_available && tesseract_opencl_available(&ocr_program);
@@ -1032,6 +1056,18 @@ fn build_index(
                 faces_detected += cached.record.face_group_ids.len();
                 records.push(cached.record.clone().into_record(path_text));
                 reused += 1;
+                if records.len().saturating_sub(cache_written) >= batch_size {
+                    if append_index_cache(
+                        cache_path.as_deref(),
+                        &folder,
+                        &records[cache_written..],
+                        &fingerprints,
+                    )
+                    .is_ok()
+                    {
+                        cache_written = records.len();
+                    }
+                }
                 let processed = position + 1;
                 if processed == total || processed % 5 == 0 {
                     app.emit(
@@ -1139,6 +1175,18 @@ fn build_index(
             }
             Err(_) => skipped += 1,
         }
+        if records.len().saturating_sub(cache_written) >= batch_size {
+            if append_index_cache(
+                cache_path.as_deref(),
+                &folder,
+                &records[cache_written..],
+                &fingerprints,
+            )
+            .is_ok()
+            {
+                cache_written = records.len();
+            }
+        }
         let processed = position + 1;
         // Emit in small batches rather than once per file; large folders remain responsive.
         if processed == total || processed % 5 == 0 {
@@ -1169,13 +1217,13 @@ fn build_index(
     records.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
     refresh_face_cluster_counts(&mut face_clusters, &records);
     // A cache write failure must not discard the freshly built in-memory index.
-    let _ = save_index_cache(
+    let _ = append_index_cache(
         cache_path.as_deref(),
         &folder,
-        &records,
+        &records[cache_written..],
         &fingerprints,
-        &face_clusters,
     );
+    let _ = save_index_cache_state(cache_path.as_deref(), &folder, &face_clusters);
     let indexed = records.len();
     let face_groups = face_clusters.len();
     *index.data.lock().map_err(|_| "索引暫時無法使用。")? = IndexData {
@@ -1446,6 +1494,9 @@ fn update_model_settings(
     if settings.max_indexed_images == Some(0) {
         return Err("圖片上限至少必須是 1，或選擇無上限。".to_owned());
     }
+    if settings.index_batch_size == 0 {
+        return Err("SQLite 每批寫入張數至少必須是 1。".to_owned());
+    }
     if let Some(path) = settings_file(index.inner()) {
         save_settings(&path, &settings)?;
     }
@@ -1594,6 +1645,7 @@ mod tests {
         let settings: ModelSettings = serde_json::from_str(r#"{"clip_gpu":true}"#).unwrap();
         assert!(settings.clip_gpu);
         assert_eq!(settings.max_indexed_images, Some(DEFAULT_MAX_INDEXED_IMAGES));
+        assert_eq!(settings.index_batch_size, DEFAULT_INDEX_BATCH_SIZE);
         assert!(!settings.thumbnail_gpu);
         assert!(!settings.face_gpu);
         assert!(!settings.ocr_gpu);
@@ -1636,7 +1688,9 @@ mod tests {
                 modified_ns: 123,
             },
         )]);
-        save_index_cache(Some(&cache_path), root, &[record], &fingerprints, &[]).unwrap();
+        reset_index_cache(Some(&cache_path), root).unwrap();
+        append_index_cache(Some(&cache_path), root, &[record], &fingerprints).unwrap();
+        save_index_cache_state(Some(&cache_path), root, &[]).unwrap();
         let cached = load_cached_images(Some(&cache_path), root);
         let cached_record = cached.get(&path).unwrap();
         assert_eq!(cached_record.fingerprint.bytes, 42);
