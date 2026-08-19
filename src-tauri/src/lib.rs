@@ -59,6 +59,7 @@ const DEFAULT_INDEX_BATCH_SIZE: usize = 50;
 // batch is waiting to be committed. The normal SQLite batch size is the same,
 // but this separate cap also protects users who configure a very large batch.
 const MAX_PENDING_THUMBNAILS: usize = 50;
+const MAX_PENDING_EMBEDDINGS: usize = 50;
 const MAX_BROWSE_RESULTS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 60;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
@@ -125,14 +126,15 @@ struct ImageRecord {
     ocr_text: String,
     people: Vec<String>,
     score: f32,
-    #[serde(skip)]
-    embedding: Option<Vec<f32>>,
+    // CLIP image vectors live exclusively in sqlite-vec; only face group IDs
+    // remain in the in-memory record.
     #[serde(skip)]
     face_group_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedImageRecord {
+    // This metadata payload intentionally excludes thumbnails and CLIP vectors.
     filename: String,
     modified_at: String,
     #[serde(default)]
@@ -141,7 +143,6 @@ struct CachedImageRecord {
     height: Option<u32>,
     ocr_text: String,
     people: Vec<String>,
-    embedding: Option<Vec<f32>>,
     face_group_ids: Vec<String>,
 }
 
@@ -155,7 +156,6 @@ impl CachedImageRecord {
             height: record.height,
             ocr_text: record.ocr_text.clone(),
             people: record.people.clone(),
-            embedding: record.embedding.clone(),
             face_group_ids: record.face_group_ids.clone(),
         }
     }
@@ -175,7 +175,6 @@ impl CachedImageRecord {
             ocr_text: self.ocr_text,
             people: self.people,
             score: 1.0,
-            embedding: self.embedding,
             face_group_ids: self.face_group_ids,
         }
     }
@@ -233,6 +232,7 @@ struct AppIndex {
     settings: Arc<Mutex<ModelSettings>>,
     settings_file: Arc<Mutex<Option<PathBuf>>>,
     cache_file: Arc<Mutex<Option<PathBuf>>>,
+    root: Arc<Mutex<Option<String>>>,
     scan_control: Arc<ScanControl>,
 }
 
@@ -329,6 +329,10 @@ fn settings_file(index: &AppIndex) -> Option<PathBuf> {
 
 fn cache_file(index: &AppIndex) -> Option<PathBuf> {
     index.cache_file.lock().ok()?.clone()
+}
+
+fn current_root(index: &AppIndex) -> Option<String> {
+    index.root.lock().ok()?.clone()
 }
 
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
@@ -666,7 +670,6 @@ mod tests {
             ocr_text: "receipt".to_owned(),
             people: vec!["Tony".to_owned()],
             score: 1.0,
-            embedding: Some(vec![0.25, 0.75]),
             face_group_ids: vec!["face-1".to_owned()],
         };
         let fingerprints = HashMap::from([(
@@ -677,8 +680,25 @@ mod tests {
             },
         )]);
         reset_index_cache(Some(&cache_path), root).unwrap();
-        append_index_cache(Some(&cache_path), root, &[record], &fingerprints).unwrap();
+        append_index_cache(
+            Some(&cache_path),
+            root,
+            &[record],
+            &fingerprints,
+            &HashMap::new(),
+        )
+        .unwrap();
         save_index_cache_state(Some(&cache_path), root, &[]).unwrap();
+        let connection = open_index_cache(&cache_path).unwrap();
+        let payload: String = connection
+            .query_row(
+                "SELECT record_json FROM image_cache WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("\"embedding\""));
+        drop(connection);
         let cached = load_cached_images(Some(&cache_path), root);
         let cached_record = cached.get(&path).unwrap();
         assert_eq!(cached_record.fingerprint.bytes, 42);
@@ -687,12 +707,60 @@ mod tests {
             Some("2025-07-01 12:34:56")
         );
         assert_eq!(cached_record.record.ocr_text, "receipt");
-        assert_eq!(cached_record.record.embedding, Some(vec![0.25, 0.75]));
         assert!(cached_record.thumbnail_available);
         assert!(cached_record.record.clone().into_record(path.clone()).thumbnail.is_empty());
         let mut hydrated = vec![cached_record.record.clone().into_record(path.clone())];
         hydrate_thumbnails(Some(&cache_path), &mut hydrated);
         assert_eq!(hydrated[0].thumbnail, "data:image/jpeg;base64,AA==");
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn legacy_json_embeddings_are_migrated_to_sqlite_vec() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "local-lens-legacy-embedding-test-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = "C:\\Photos";
+        let path = "C:\\Photos\\legacy.jpg";
+        let legacy_json = serde_json::json!({
+            "filename": "legacy.jpg",
+            "modified_at": "1",
+            "captured_at": null,
+            "width": 1200,
+            "height": 800,
+            "thumbnail": "",
+            "ocr_text": "",
+            "people": [],
+            "embedding": vec![1.0; VECTOR_DIMENSION],
+            "face_group_ids": []
+        })
+        .to_string();
+        let connection = open_index_cache(&cache_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO image_cache(root, path, bytes, modified_ns, record_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![root, path, 42_u64, "1", legacy_json],
+            )
+            .unwrap();
+        drop(connection);
+
+        let cached = load_cached_images(Some(&cache_path), root);
+        assert!(cached.contains_key(path));
+        assert!(has_clip_vectors(Some(&cache_path), Some(root)));
+        let scores = sqlite_vec_search_scores(
+            Some(&cache_path),
+            Some(root),
+            "clip",
+            &[vec![1.0; VECTOR_DIMENSION]],
+            1,
+        )
+        .unwrap();
+        assert!(scores.get(path).is_some_and(|score| *score > 0.99));
         let _ = fs::remove_file(cache_path);
     }
 
@@ -720,7 +788,6 @@ mod tests {
             ocr_text: "receipt invoice".to_owned(),
             people: vec!["Tony".to_owned()],
             score: 1.0,
-            embedding: Some(vec![1.0; VECTOR_DIMENSION]),
             face_group_ids: Vec::new(),
         };
         let fingerprints = HashMap::from([(
@@ -731,17 +798,26 @@ mod tests {
             },
         )]);
 
-        append_index_cache(Some(&cache_path), root, &[record], &fingerprints).unwrap();
+        let clip_embeddings = HashMap::from([(path.clone(), Some(vec![1.0; VECTOR_DIMENSION]))]);
+        append_index_cache(
+            Some(&cache_path),
+            root,
+            &[record],
+            &fingerprints,
+            &clip_embeddings,
+        )
+        .unwrap();
         let text = TextQueryPlan {
             should: vec!["receipt".to_owned()],
             must: Vec::new(),
             must_not: Vec::new(),
         };
-        let text_scores = fts5_search_scores(Some(&cache_path), &text).unwrap();
+        let text_scores = fts5_search_scores(Some(&cache_path), Some(root), &text).unwrap();
         assert_eq!(text_scores.get(&path), Some(&1.0));
 
         let vector_scores = sqlite_vec_search_scores(
             Some(&cache_path),
+            Some(root),
             "clip",
             &[vec![1.0; VECTOR_DIMENSION]],
             10,

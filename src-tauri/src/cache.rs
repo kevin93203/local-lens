@@ -63,6 +63,9 @@ pub(super) fn open_index_cache(path: &Path) -> Result<Connection, String> {
                 root TEXT PRIMARY KEY NOT NULL,
                 face_groups_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS clip_vector_migrations (
+                root TEXT PRIMARY KEY NOT NULL
+            );
             ",
         )
         .map_err(|error| format!("無法初始化 SQLite 索引快取：{error}"))?;
@@ -158,8 +161,85 @@ pub(super) fn upsert_vector_entry(
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct LegacyClipCacheRecord {
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
+}
+
+fn flush_legacy_clip_embeddings(
+    connection: &mut Connection,
+    root: &str,
+    pending: &mut Vec<(String, Vec<f32>)>,
+) -> Result<(), String> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    for (path, embedding) in pending.drain(..) {
+        upsert_vector_entry(&transaction, "clip", root, &path, "", &embedding)?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_legacy_clip_vectors(path: &Path, root: &str) -> Result<(), String> {
+    let connection = open_index_cache(path)?;
+    let migrated: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM clip_vector_migrations WHERE root = ?1)",
+            params![root],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    if migrated {
+        return Ok(());
+    }
+
+    // Read legacy JSON one row at a time and retain at most a small batch of
+    // vectors. New records never contain this field; this is only for caches
+    // created before sqlite-vec became the authoritative vector store.
+    let read_connection = open_index_cache(path)?;
+    let mut write_connection = open_index_cache(path)?;
+    let mut statement = read_connection
+        .prepare("SELECT path, record_json FROM image_cache WHERE root = ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![root], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut pending = Vec::new();
+    for row in rows {
+        let (path, record_json) = row.map_err(|error| error.to_string())?;
+        let Some(embedding) = serde_json::from_str::<LegacyClipCacheRecord>(&record_json)
+            .ok()
+            .and_then(|record| record.embedding)
+            .filter(|embedding| embedding.len() == VECTOR_DIMENSION)
+        else {
+            continue;
+        };
+        pending.push((path, embedding));
+        if pending.len() >= MAX_PENDING_EMBEDDINGS {
+            flush_legacy_clip_embeddings(&mut write_connection, root, &mut pending)?;
+        }
+    }
+    drop(statement);
+    drop(read_connection);
+    flush_legacy_clip_embeddings(&mut write_connection, root, &mut pending)?;
+    write_connection
+        .execute(
+            "INSERT OR REPLACE INTO clip_vector_migrations(root) VALUES (?1)",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(super) fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, CachedImage> {
     let Some(path) = path else { return HashMap::new() };
+    let _ = migrate_legacy_clip_vectors(path, root);
     let Ok(connection) = open_index_cache(path) else { return HashMap::new() };
     let Ok(mut statement) = connection.prepare(
         "SELECT c.path, c.bytes, c.modified_ns, c.record_json, \
@@ -223,22 +303,9 @@ pub(super) fn reset_index_cache(path: Option<&Path>, root: &str) -> Result<(), S
     connection
         .execute("DELETE FROM image_ocr_fts WHERE root = ?1", params![root])
         .map_err(|error| error.to_string())?;
-    let vector_ids: Vec<i64> = connection
-        .prepare("SELECT vector_rowid FROM vector_rows WHERE root = ?1")
-        .and_then(|mut statement| {
-            statement
-                .query_map(params![root], |row| row.get::<_, i64>(0))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .map_err(|error| error.to_string())?;
-    for rowid in vector_ids {
-        connection
-            .execute("DELETE FROM image_vectors WHERE rowid = ?1", params![rowid])
-            .map_err(|error| error.to_string())?;
-    }
-    connection
-        .execute("DELETE FROM vector_rows WHERE root = ?1", params![root])
-        .map_err(|error| error.to_string())?;
+    // Keep CLIP vectors for unchanged files. They are the source of truth for
+    // semantic search and are reconciled after the scan; deleting them here
+    // would force every reused image to load its vector into RAM again.
     connection
         .execute("DELETE FROM scan_state WHERE root = ?1", params![root])
         .map_err(|error| error.to_string())?;
@@ -250,6 +317,7 @@ pub(super) fn append_index_cache(
     root: &str,
     records: &[ImageRecord],
     fingerprints: &HashMap<String, FileFingerprint>,
+    clip_embeddings: &HashMap<String, Option<Vec<f32>>>,
 ) -> Result<(), String> {
     let Some(path) = path else { return Ok(()) };
     let mut connection = open_index_cache(path)?;
@@ -297,10 +365,12 @@ pub(super) fn append_index_cache(
                 )
                 .map_err(|error| error.to_string())?;
         }
-        if let Some(embedding) = &record.embedding {
-            upsert_vector_entry(&transaction, "clip", root, &record.path, "", embedding)?;
+    }
+    for (path, embedding) in clip_embeddings {
+        if let Some(embedding) = embedding {
+            upsert_vector_entry(&transaction, "clip", root, path, "", embedding)?;
         } else {
-            delete_vector_entry(&transaction, "clip", root, &record.path, "")?;
+            delete_vector_entry(&transaction, "clip", root, path, "")?;
         }
     }
     transaction.commit().map_err(|error| error.to_string())
@@ -311,8 +381,9 @@ pub(super) fn append_index_cache_and_release(
     root: &str,
     records: &mut [ImageRecord],
     fingerprints: &HashMap<String, FileFingerprint>,
+    clip_embeddings: &mut HashMap<String, Option<Vec<f32>>>,
 ) -> Result<(), String> {
-    append_index_cache(path, root, records, fingerprints)?;
+    append_index_cache(path, root, records, fingerprints, clip_embeddings)?;
     if path.is_some() {
         // The durable copy is now in image_thumbnails. Do not retain the
         // Base64 data URL in the full in-memory index.
@@ -321,6 +392,7 @@ pub(super) fn append_index_cache_and_release(
                 record.thumbnail.clear();
             }
         }
+        clip_embeddings.clear();
     }
     Ok(())
 }
@@ -363,6 +435,54 @@ pub(super) fn hydrate_thumbnails(path: Option<&Path>, records: &mut [ImageRecord
             record.thumbnail = thumbnail_data_url(&bytes);
         }
     }
+}
+
+pub(super) fn cleanup_stale_clip_vectors(path: Option<&Path>, root: &str) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let connection = open_index_cache(path)?;
+    let stale_ids: Vec<i64> = connection
+        .prepare(
+            "SELECT vector_rowid FROM vector_rows
+             WHERE kind = 'clip' AND root = ?1
+               AND path NOT IN (SELECT path FROM image_cache WHERE root = ?1)",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![root], |row| row.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .map_err(|error| error.to_string())?;
+    for rowid in stale_ids {
+        connection
+            .execute("DELETE FROM image_vectors WHERE rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute(
+            "DELETE FROM vector_rows
+             WHERE kind = 'clip' AND root = ?1
+               AND path NOT IN (SELECT path FROM image_cache WHERE root = ?1)",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(super) fn has_clip_vectors(path: Option<&Path>, root: Option<&str>) -> bool {
+    let Some(path) = path else { return false };
+    let Some(root) = root else { return false };
+    let Ok(connection) = open_index_cache(path) else { return false };
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM vector_rows
+                 WHERE kind = 'clip' AND root = ?1
+             )",
+            params![root],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .unwrap_or(false)
 }
 
 pub(super) fn save_index_cache_state(

@@ -73,8 +73,13 @@ pub(super) fn semantic_threshold(best_score: Option<f32>) -> f32 {
         .unwrap_or(MIN_SEMANTIC_SIMILARITY)
 }
 
-pub(super) fn fts5_search_scores(path: Option<&Path>, text: &TextQueryPlan) -> Option<HashMap<String, f32>> {
+pub(super) fn fts5_search_scores(
+    path: Option<&Path>,
+    root: Option<&str>,
+    text: &TextQueryPlan,
+) -> Option<HashMap<String, f32>> {
     let path = path?;
+    let root = root?;
     let connection = open_index_cache(path).ok()?;
     let mut scores = HashMap::new();
     let terms = text.should.iter().chain(text.must.iter());
@@ -84,11 +89,11 @@ pub(super) fn fts5_search_scores(path: Option<&Path>, text: &TextQueryPlan) -> O
         let mut statement = connection
             .prepare(
                 "SELECT path FROM image_ocr_fts \
-                 WHERE image_ocr_fts MATCH ?1",
+                 WHERE image_ocr_fts MATCH ?1 AND root = ?2",
             )
             .ok()?;
         let rows = statement
-            .query_map(params![match_query], |row| row.get::<_, String>(0))
+            .query_map(params![match_query, root], |row| row.get::<_, String>(0))
             .ok()?;
         for row in rows.flatten() {
             *scores.entry(row).or_insert(0.0) += 1.0;
@@ -98,10 +103,10 @@ pub(super) fn fts5_search_scores(path: Option<&Path>, text: &TextQueryPlan) -> O
         let escaped = term.replace('"', "\"\"");
         let match_query = format!("\"{escaped}\"");
         let mut statement = connection
-            .prepare("SELECT path FROM image_ocr_fts WHERE image_ocr_fts MATCH ?1")
+            .prepare("SELECT path FROM image_ocr_fts WHERE image_ocr_fts MATCH ?1 AND root = ?2")
             .ok()?;
         let rows = statement
-            .query_map(params![match_query], |row| row.get::<_, String>(0))
+            .query_map(params![match_query, root], |row| row.get::<_, String>(0))
             .ok()?;
         for row in rows.flatten() {
             scores.remove(&row);
@@ -112,11 +117,13 @@ pub(super) fn fts5_search_scores(path: Option<&Path>, text: &TextQueryPlan) -> O
 
 pub(super) fn sqlite_vec_search_scores(
     path: Option<&Path>,
+    root: Option<&str>,
     kind: &str,
     embeddings: &[Vec<f32>],
     limit: usize,
 ) -> Option<HashMap<String, f32>> {
     let path = path?;
+    let root = root?;
     let connection = open_index_cache(path).ok()?;
     let mut scores = HashMap::new();
     for embedding in embeddings {
@@ -128,12 +135,12 @@ pub(super) fn sqlite_vec_search_scores(
             .prepare(
                 "SELECT rowid, distance FROM image_vectors \
                  WHERE embedding MATCH ?1 AND k = ?2 \
-                 AND rowid IN (SELECT vector_rowid FROM vector_rows WHERE kind = ?3) \
+                 AND rowid IN (SELECT vector_rowid FROM vector_rows WHERE kind = ?3 AND root = ?4) \
                  ORDER BY distance",
             )
             .ok()?;
         let rows = statement
-            .query_map(params![blob, limit as i64, kind], |row| {
+            .query_map(params![blob, limit as i64, kind, root], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
             })
             .ok()?;
@@ -141,8 +148,8 @@ pub(super) fn sqlite_vec_search_scores(
             let (rowid, distance) = row;
             let path_value = connection
                 .query_row(
-                    "SELECT path FROM vector_rows WHERE vector_rowid = ?1 AND kind = ?2",
-                    params![rowid, kind],
+                    "SELECT path FROM vector_rows WHERE vector_rowid = ?1 AND kind = ?2 AND root = ?3",
+                    params![rowid, kind, root],
                     |row| row.get::<_, String>(0),
                 )
                 .ok();
@@ -164,6 +171,7 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
     let data = index.data.lock().map_err(|_| "索引暫時無法使用。")?;
     let records = &data.images;
     let cache_path = cache_file(&index);
+    let root = current_root(&index);
     if query.trim().is_empty() {
         let mut results: Vec<ImageRecord> = records.iter().take(MAX_BROWSE_RESULTS).cloned().collect();
         hydrate_thumbnails(cache_path.as_deref(), &mut results);
@@ -176,23 +184,23 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
     known_people.sort_unstable();
     known_people.dedup();
     let plan = parse_query(&query, &known_people);
-    let fts_scores = fts5_search_scores(cache_path.as_deref(), &plan.text);
-    let query_embeddings = if !plan.semantic_query.is_empty()
-        && records.iter().any(|record| record.embedding.is_some())
-    {
+    let clip_vectors_available = has_clip_vectors(cache_path.as_deref(), root.as_deref());
+    let fts_scores = fts5_search_scores(cache_path.as_deref(), root.as_deref(), &plan.text);
+    let query_embeddings = if !plan.semantic_query.is_empty() && clip_vectors_available {
         embed_queries(&plan.semantic_query, settings.clip_gpu)
     } else {
         Vec::new()
     };
     let vector_scores = sqlite_vec_search_scores(
         cache_path.as_deref(),
+        root.as_deref(),
         "clip",
         &query_embeddings,
         MAX_SEARCH_RESULTS.saturating_mul(5),
     );
     let semantic_search = vector_scores
         .as_ref()
-        .map_or(!query_embeddings.is_empty(), |scores| !scores.is_empty());
+        .is_some_and(|scores| !scores.is_empty());
     let has_positive_query = !plan.semantic_query.is_empty()
         || !plan.text.should.is_empty()
         || !plan.text.must.is_empty();
@@ -258,16 +266,11 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
             } else {
                 memory_lexical_score
             };
-            let semantic_score = record.embedding.as_ref().and_then(|image_vector| {
-                if let Some(scores) = &vector_scores {
-                    scores.get(&record.path).copied()
-                } else {
-                    query_embeddings
-                        .iter()
-                        .map(|query_vector| cosine_similarity(query_vector, image_vector))
-                        .max_by(f32::total_cmp)
-                }
-            });
+            // sqlite-vec is the only source of image embeddings. Search
+            // candidates carry only their path and score, never the vector.
+            let semantic_score = vector_scores
+                .as_ref()
+                .and_then(|scores| scores.get(&record.path).copied());
             SearchCandidate {
                 record: record.clone(),
                 lexical_score,

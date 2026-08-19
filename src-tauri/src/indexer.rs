@@ -52,6 +52,7 @@ pub(super) fn build_index(
     let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let mut cache_written = 0usize;
     let mut pending_thumbnails = 0usize;
+    let mut pending_clip_embeddings: HashMap<String, Option<Vec<f32>>> = HashMap::new();
     let batch_size = settings.index_batch_size.max(1);
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
@@ -83,8 +84,8 @@ pub(super) fn build_index(
     if let Some(error) = clip_gpu_error {
         gpu_warnings.push(error);
     }
-    let mut semantic_available = image_model.is_some()
-        || cached_images.values().any(|cached| cached.record.embedding.is_some());
+    let mut semantic_available =
+        image_model.is_some() || has_clip_vectors(cache_path.as_deref(), Some(&folder));
     let (mut face_engine, face_gpu_active, face_gpu_error) = if needs_processing {
         match load_face_engine(settings.face_gpu && gpu_available) {
             Ok((engine, active, error)) => (Some(engine), active, error),
@@ -143,12 +144,14 @@ pub(super) fn build_index(
                 reused += 1;
                 if records.len().saturating_sub(cache_written) >= batch_size
                     || pending_thumbnails >= MAX_PENDING_THUMBNAILS
+                    || pending_clip_embeddings.len() >= MAX_PENDING_EMBEDDINGS
                 {
                     if append_index_cache_and_release(
                         cache_path.as_deref(),
                         &folder,
                         &mut records[cache_written..],
                         &fingerprints,
+                        &mut pending_clip_embeddings,
                     )
                     .is_ok()
                     {
@@ -168,7 +171,7 @@ pub(super) fn build_index(
                             reused,
                             skipped,
                             ocr_available,
-                            semantic_available: semantic_available || records.iter().any(|record| record.embedding.is_some()),
+                            semantic_available,
                             face_available,
                             faces_detected,
                             clip_gpu_active,
@@ -267,9 +270,14 @@ pub(super) fn build_index(
                     },
                     people,
                     score: 1.0,
-                    embedding,
                     face_group_ids,
                 });
+                if cache_path.is_some() {
+                    pending_clip_embeddings.insert(
+                        records.last().map(|record| record.path.clone()).unwrap_or_default(),
+                        embedding,
+                    );
+                }
                 if cache_path.is_some()
                     && records
                         .last()
@@ -282,12 +290,14 @@ pub(super) fn build_index(
         }
         if records.len().saturating_sub(cache_written) >= batch_size
             || pending_thumbnails >= MAX_PENDING_THUMBNAILS
+            || pending_clip_embeddings.len() >= MAX_PENDING_EMBEDDINGS
         {
             if append_index_cache_and_release(
                 cache_path.as_deref(),
                 &folder,
                 &mut records[cache_written..],
                 &fingerprints,
+                &mut pending_clip_embeddings,
             )
             .is_ok()
             {
@@ -332,8 +342,11 @@ pub(super) fn build_index(
         &folder,
         &mut records[cache_written..],
         &fingerprints,
+        &mut pending_clip_embeddings,
     );
     let _ = cleanup_stale_thumbnails(cache_path.as_deref(), &folder);
+    let _ = cleanup_stale_clip_vectors(cache_path.as_deref(), &folder);
+    semantic_available = has_clip_vectors(cache_path.as_deref(), Some(&folder));
     let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let _ = save_index_cache_state(cache_path.as_deref(), &folder, &face_clusters);
     records.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
@@ -343,6 +356,9 @@ pub(super) fn build_index(
         images: records,
         face_groups: face_clusters,
     };
+    if let Ok(mut current_root) = index.root.lock() {
+        *current_root = Some(folder.clone());
+    }
     Ok(ScanResult {
         root: folder,
         indexed,
