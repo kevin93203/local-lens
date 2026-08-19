@@ -166,6 +166,112 @@ pub(super) fn sqlite_vec_search_scores(
     (!scores.is_empty()).then_some(scores)
 }
 
+struct ScoredCandidate {
+    index: usize,
+    lexical_score: f32,
+    lexical_allowed: bool,
+    semantic_score: Option<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct RankedCandidate {
+    index: usize,
+    score: f32,
+}
+
+fn score_record(
+    index: usize,
+    record: &ImageRecord,
+    plan: &QueryPlan,
+    fts_scores: Option<&HashMap<String, f32>>,
+    vector_scores: Option<&HashMap<String, f32>>,
+) -> Option<ScoredCandidate> {
+    if !record_matches_plan(record, plan) {
+        return None;
+    }
+    let haystack = format!(
+        "{} {} {}",
+        record.filename,
+        record.ocr_text,
+        record.people.join(" ")
+    )
+    .to_lowercase();
+    let compact_haystack: String = haystack
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let positive_terms = plan.text.should.iter().chain(plan.text.must.iter());
+    let matched = positive_terms
+        .clone()
+        .filter(|term| {
+            haystack.contains(term.as_str())
+                || compact_haystack.contains(
+                    &term
+                        .chars()
+                        .filter(|character| !character.is_whitespace())
+                        .collect::<String>(),
+                )
+        })
+        .count();
+    let excluded = plan.text.must_not.iter().any(|term| {
+        haystack.contains(term.as_str())
+            || compact_haystack.contains(
+                &term
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>(),
+            )
+    });
+    let total_terms = plan.text.should.len() + plan.text.must.len();
+    let memory_lexical_score = if total_terms == 0 {
+        0.0
+    } else {
+        matched as f32 / total_terms as f32
+    };
+    let lexical_score = if excluded {
+        0.0
+    } else if let Some(scores) = fts_scores {
+        scores
+            .get(&record.path)
+            .copied()
+            .unwrap_or(0.0)
+            .max(memory_lexical_score)
+    } else {
+        memory_lexical_score
+    };
+    // sqlite-vec is the only source of image embeddings. Search candidates
+    // carry only an index and scores, never a complete ImageRecord copy.
+    let semantic_score = vector_scores.and_then(|scores| scores.get(&record.path).copied());
+    Some(ScoredCandidate {
+        index,
+        lexical_score,
+        lexical_allowed: !excluded,
+        semantic_score,
+    })
+}
+
+fn insert_top_k(
+    top: &mut Vec<RankedCandidate>,
+    candidate: RankedCandidate,
+    limit: usize,
+    records: &[ImageRecord],
+) {
+    if limit == 0 {
+        return;
+    }
+    top.push(candidate);
+    top.sort_unstable_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| records[left.index].filename.cmp(&records[right.index].filename))
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    if top.len() > limit {
+        top.truncate(limit);
+    }
+}
+
 pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>, String> {
     let settings = current_settings(&index);
     let data = index.data.lock().map_err(|_| "索引暫時無法使用。")?;
@@ -205,110 +311,71 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
         || !plan.text.should.is_empty()
         || !plan.text.must.is_empty();
 
-    struct SearchCandidate {
-        record: ImageRecord,
-        lexical_score: f32,
-        lexical_allowed: bool,
-        semantic_score: Option<f32>,
-    }
-
-    let candidates: Vec<SearchCandidate> = records
+    // First pass only retains the best semantic score needed by the adaptive
+    // threshold. No ImageRecord is cloned or stored for all candidates.
+    let best_semantic_score = records
         .iter()
-        .filter(|record| record_matches_plan(record, &plan))
-        .map(|record| {
-            let haystack = format!(
-                "{} {} {}",
-                record.filename,
-                record.ocr_text,
-                record.people.join(" ")
+        .enumerate()
+        .filter_map(|(index, record)| {
+            score_record(
+                index,
+                record,
+                &plan,
+                fts_scores.as_ref(),
+                vector_scores.as_ref(),
             )
-            .to_lowercase();
-            let compact_haystack: String = haystack
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect();
-            let positive_terms = plan.text.should.iter().chain(plan.text.must.iter());
-            let matched = positive_terms
-                .clone()
-                .filter(|term| {
-                    haystack.contains(term.as_str())
-                        || compact_haystack.contains(
-                            &term
-                                .chars()
-                                .filter(|character| !character.is_whitespace())
-                                .collect::<String>(),
-                        )
-                })
-                .count();
-            let excluded = plan.text.must_not.iter().any(|term| {
-                haystack.contains(term.as_str())
-                    || compact_haystack.contains(
-                        &term
-                            .chars()
-                            .filter(|character| !character.is_whitespace())
-                            .collect::<String>(),
-                    )
-            });
-            let total_terms = plan.text.should.len() + plan.text.must.len();
-            let memory_lexical_score = if total_terms == 0 {
-                0.0
-            } else {
-                matched as f32 / total_terms as f32
-            };
-            let lexical_score = if excluded {
-                0.0
-            } else if let Some(scores) = &fts_scores {
-                scores
-                    .get(&record.path)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .max(memory_lexical_score)
-            } else {
-                memory_lexical_score
-            };
-            // sqlite-vec is the only source of image embeddings. Search
-            // candidates carry only their path and score, never the vector.
-            let semantic_score = vector_scores
-                .as_ref()
-                .and_then(|scores| scores.get(&record.path).copied());
-            SearchCandidate {
-                record: record.clone(),
-                lexical_score,
-                lexical_allowed: !excluded,
-                semantic_score,
-            }
         })
-        .collect();
-
-    let best_semantic_score = candidates
-        .iter()
         .filter_map(|candidate| candidate.semantic_score)
         .max_by(f32::total_cmp);
     let threshold = semantic_threshold(best_semantic_score);
-    let mut matches: Vec<ImageRecord> = candidates
+    let result_limit = plan.limit.unwrap_or(MAX_SEARCH_RESULTS);
+    let mut top_matches = Vec::with_capacity(result_limit.min(records.len()));
+
+    // Second pass keeps only index + score for the Top-K results. Complete
+    // ImageRecords are cloned after ranking, and only for those results.
+    for (index, record) in records.iter().enumerate() {
+        let Some(candidate) = score_record(
+            index,
+            record,
+            &plan,
+            fts_scores.as_ref(),
+            vector_scores.as_ref(),
+        ) else {
+            continue;
+        };
+        let semantic_match = semantic_search
+            && candidate.lexical_allowed
+            && candidate
+                .semantic_score
+                .is_some_and(|score| score >= threshold);
+        let lexical_match = candidate.lexical_score > 0.0 && candidate.lexical_allowed;
+        if candidate.lexical_allowed
+            && (!has_positive_query || lexical_match || semantic_match)
+        {
+            let score = if candidate.lexical_score > 0.0 {
+                1.0 + candidate.lexical_score
+                    + candidate.semantic_score.unwrap_or(0.0).max(0.0) * 0.15
+            } else {
+                candidate.semantic_score.unwrap_or(0.0)
+            };
+            insert_top_k(
+                &mut top_matches,
+                RankedCandidate {
+                    index: candidate.index,
+                    score,
+                },
+                result_limit,
+                records,
+            );
+        }
+    }
+
+    let mut matches: Vec<ImageRecord> = top_matches
         .into_iter()
-        .filter_map(|candidate| {
-            let semantic_match = semantic_search
-                && candidate.lexical_allowed
-                && candidate
-                    .semantic_score
-                    .is_some_and(|score| score >= threshold);
-            let lexical_match = candidate.lexical_score > 0.0
-                && candidate.lexical_allowed;
-            (candidate.lexical_allowed
-                && (!has_positive_query || lexical_match || semantic_match))
-                .then(|| {
-                let mut record = candidate.record;
-                // Lexical/OCR hits are explicit evidence and should rank above a merely
-                // similar-looking image. Pure semantic matches keep their raw cosine score.
-                record.score = if candidate.lexical_score > 0.0 {
-                    1.0 + candidate.lexical_score
-                        + candidate.semantic_score.unwrap_or(0.0).max(0.0) * 0.15
-                } else {
-                    candidate.semantic_score.unwrap_or(0.0)
-                };
-                record
-            })
+        .map(|candidate| {
+            let mut record = records[candidate.index].clone();
+            record.score = candidate.score;
+            record
         })
         .collect();
     matches.sort_by(|a, b| {
