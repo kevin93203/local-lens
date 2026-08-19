@@ -103,7 +103,7 @@ pub(super) fn parse_limit(query: &str) -> Option<usize> {
             .collect();
         if let Ok(limit) = digits.parse::<usize>() {
             if limit > 0 {
-                return Some(limit.min(MAX_SEARCH_RESULTS));
+                return Some(limit);
             }
         }
     }

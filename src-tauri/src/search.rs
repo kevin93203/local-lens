@@ -125,6 +125,20 @@ pub(super) fn sqlite_vec_search_scores(
     let path = path?;
     let root = root?;
     let connection = open_index_cache(path).ok()?;
+    let knn_limit = if limit == usize::MAX {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM vector_rows WHERE kind = ?1",
+                params![kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(1)
+            .max(1)
+    } else {
+        limit.max(1)
+    };
     let mut scores = HashMap::new();
     for embedding in embeddings {
         if embedding.len() != VECTOR_DIMENSION {
@@ -140,7 +154,7 @@ pub(super) fn sqlite_vec_search_scores(
             )
             .ok()?;
         let rows = statement
-            .query_map(params![blob, limit as i64, kind, root], |row| {
+            .query_map(params![blob, knn_limit as i64, kind, root], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
             })
             .ok()?;
@@ -166,17 +180,18 @@ pub(super) fn sqlite_vec_search_scores(
     (!scores.is_empty()).then_some(scores)
 }
 
+#[derive(Serialize)]
+pub(super) struct SearchPage {
+    pub(super) images: Vec<ImageRecord>,
+    pub(super) total: usize,
+    pub(super) has_more: bool,
+}
+
 struct ScoredCandidate {
     index: usize,
     lexical_score: f32,
     lexical_allowed: bool,
     semantic_score: Option<f32>,
-}
-
-#[derive(Clone, Copy)]
-struct RankedCandidate {
-    index: usize,
-    score: f32,
 }
 
 fn score_record(
@@ -250,38 +265,69 @@ fn score_record(
     })
 }
 
-fn insert_top_k(
-    top: &mut Vec<RankedCandidate>,
-    candidate: RankedCandidate,
-    limit: usize,
+fn page_from_result_refs(
+    results: &[SearchResultRef],
     records: &[ImageRecord],
-) {
-    if limit == 0 {
-        return;
-    }
-    top.push(candidate);
-    top.sort_unstable_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| records[left.index].filename.cmp(&records[right.index].filename))
-            .then_with(|| left.index.cmp(&right.index))
-    });
-    if top.len() > limit {
-        top.truncate(limit);
+    offset: usize,
+    page_size: usize,
+    cache_path: Option<&Path>,
+) -> SearchPage {
+    let total = results.len();
+    let start = offset.min(total);
+    let end = start.saturating_add(page_size).min(total);
+    let mut images: Vec<ImageRecord> = results[start..end]
+        .iter()
+        .map(|result| {
+            let mut record = records[result.index].clone();
+            record.score = result.score;
+            record
+        })
+        .collect();
+    hydrate_thumbnails(cache_path, &mut images);
+    SearchPage {
+        images,
+        total,
+        has_more: end < total,
     }
 }
 
-pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>, String> {
+pub(super) fn search_images_page_sync(
+    query: String,
+    index: AppIndex,
+    offset: usize,
+    page_size: usize,
+) -> Result<SearchPage, String> {
     let settings = current_settings(&index);
     let data = index.data.lock().map_err(|_| "索引暫時無法使用。")?;
     let records = &data.images;
     let cache_path = cache_file(&index);
     let root = current_root(&index);
+    let page_size = page_size.max(1).min(MAX_RESULT_PAGE_SIZE);
     if query.trim().is_empty() {
-        let mut results: Vec<ImageRecord> = records.iter().take(MAX_BROWSE_RESULTS).cloned().collect();
+        let total = records.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(page_size).min(total);
+        let mut results: Vec<ImageRecord> = records[start..end].to_vec();
         hydrate_thumbnails(cache_path.as_deref(), &mut results);
-        return Ok(results);
+        return Ok(SearchPage {
+            images: results,
+            total,
+            has_more: end < total,
+        });
+    }
+    if let Ok(session) = index.search_session.lock() {
+        if let Some(session) = session.as_ref().filter(|session| {
+            session.root.as_ref() == root.as_ref()
+                && session.query.as_str() == query.as_str()
+        }) {
+            return Ok(page_from_result_refs(
+                &session.results,
+                records,
+                offset,
+                page_size,
+                cache_path.as_deref(),
+            ));
+        }
     }
     let mut known_people: Vec<String> = records
         .iter()
@@ -302,7 +348,10 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
         root.as_deref(),
         "clip",
         &query_embeddings,
-        MAX_SEARCH_RESULTS.saturating_mul(5),
+        // Fetch every vector row so the adaptive threshold is applied to the
+        // complete result set, then filter back to this root. Only the
+        // requested page is hydrated below.
+        usize::MAX,
     );
     let semantic_search = vector_scores
         .as_ref()
@@ -328,11 +377,11 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
         .filter_map(|candidate| candidate.semantic_score)
         .max_by(f32::total_cmp);
     let threshold = semantic_threshold(best_semantic_score);
-    let result_limit = plan.limit.unwrap_or(MAX_SEARCH_RESULTS);
-    let mut top_matches = Vec::with_capacity(result_limit.min(records.len()));
+    let mut ranked_matches = Vec::with_capacity(records.len());
 
-    // Second pass keeps only index + score for the Top-K results. Complete
-    // ImageRecords are cloned after ranking, and only for those results.
+    // Second pass keeps only index + score for every qualifying result. This
+    // minimal session is reused by subsequent pages; complete ImageRecords are
+    // cloned only for the page requested by the UI.
     for (index, record) in records.iter().enumerate() {
         let Some(candidate) = score_record(
             index,
@@ -358,34 +407,43 @@ pub(super) fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<I
             } else {
                 candidate.semantic_score.unwrap_or(0.0)
             };
-            insert_top_k(
-                &mut top_matches,
-                RankedCandidate {
-                    index: candidate.index,
-                    score,
-                },
-                result_limit,
-                records,
-            );
+            ranked_matches.push(SearchResultRef {
+                index: candidate.index,
+                score,
+            });
         }
     }
 
-    let mut matches: Vec<ImageRecord> = top_matches
-        .into_iter()
-        .map(|candidate| {
-            let mut record = records[candidate.index].clone();
-            record.score = candidate.score;
-            record
-        })
-        .collect();
-    matches.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.filename.cmp(&b.filename))
+    ranked_matches.sort_unstable_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| records[left.index].filename.cmp(&records[right.index].filename))
+            .then_with(|| left.index.cmp(&right.index))
     });
-    // Semantic search intentionally returns a compact high-confidence set.
-    // Only this bounded result set receives Base64 thumbnail data URLs for IPC.
-    matches.truncate(plan.limit.unwrap_or(MAX_SEARCH_RESULTS));
-    hydrate_thumbnails(cache_path.as_deref(), &mut matches);
-    Ok(matches)
+    if let Some(limit) = plan.limit {
+        ranked_matches.truncate(limit);
+    }
+    let page = page_from_result_refs(
+        &ranked_matches,
+        records,
+        offset,
+        page_size,
+        cache_path.as_deref(),
+    );
+    if let Ok(mut session) = index.search_session.lock() {
+        *session = Some(SearchSessionState {
+            root,
+            query,
+            results: ranked_matches,
+        });
+    }
+    Ok(page)
+}
+
+pub(super) fn search_images_sync(
+    query: String,
+    index: AppIndex,
+) -> Result<Vec<ImageRecord>, String> {
+    search_images_page_sync(query, index, 0, DEFAULT_RESULT_PAGE_SIZE).map(|page| page.images)
 }

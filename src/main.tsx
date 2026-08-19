@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -20,6 +20,7 @@ type ImageRecord = {
   score: number;
 };
 
+type SearchPage = { images: ImageRecord[]; total: number; has_more: boolean };
 type FaceGroup = { id: string; name?: string; face_count: number; image_count: number; preview: string };
 type ScanResult = { root: string; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; face_groups: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
 type ScanProgress = { processed: number; total: number; eta_seconds: number | null; indexed: number; reused: number; skipped: number; ocr_available: boolean; semantic_available: boolean; face_available: boolean; faces_detected: number; clip_gpu_active: boolean; face_gpu_active: boolean; thumbnail_gpu_requested: boolean; thumbnail_gpu_active: boolean; ocr_gpu_requested: boolean; ocr_gpu_active: boolean; gpu_warning?: string | null };
@@ -27,6 +28,7 @@ type ModelSettings = { max_indexed_images: number | null; index_batch_size: numb
 type SettingsInfo = { settings: ModelSettings; directml_available: boolean; directml_error?: string | null; thumbnail_gpu_available: boolean; ocr_gpu_experimental: boolean };
 
 const DEFAULT_MODEL_SETTINGS: ModelSettings = { max_indexed_images: 3000, index_batch_size: 50, thumbnail_gpu: false, ocr_gpu: false, clip_gpu: false, face_gpu: false };
+const RESULT_PAGE_SIZE = 60;
 
 function formatEta(seconds: number | null): string {
   if (seconds === null) return "正在估算完成時間…";
@@ -45,7 +47,13 @@ function formatEta(seconds: number | null): string {
 
 function App() {
   const [query, setQuery] = useState("");
+  const [activeQuery, setActiveQuery] = useState("");
   const [images, setImages] = useState<ImageRecord[]>([]);
+  const [hasMoreResults, setHasMoreResults] = useState(false);
+  const [totalResults, setTotalResults] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const searchRequestRef = useRef(0);
   const [folder, setFolder] = useState("");
   const [status, setStatus] = useState("選擇一個照片資料夾來建立本機索引。");
   const [busy, setBusy] = useState(false);
@@ -95,25 +103,70 @@ function App() {
     }
   }
 
+  function applySearchPage(page: SearchPage, append: boolean) {
+    setImages((current) => append ? [...current, ...page.images] : page.images);
+    setHasMoreResults(page.has_more);
+    setTotalResults(page.total);
+  }
+
+  async function loadMoreResults() {
+    if (!folder || !hasMoreResults || loadingMore || busy) return;
+    const requestId = searchRequestRef.current;
+    setLoadingMore(true);
+    try {
+      const page = await invoke<SearchPage>("search_images_page", {
+        query: activeQuery,
+        offset: images.length,
+        limit: RESULT_PAGE_SIZE,
+      });
+      if (requestId !== searchRequestRef.current) return;
+      applySearchPage(page, true);
+    } catch (error) {
+      if (requestId === searchRequestRef.current) {
+        setStatus(`載入更多搜尋結果失敗：${String(error)}`);
+      }
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  useEffect(() => {
+    const target = loadMoreRef.current;
+    if (!target || !hasMoreResults || busy || loadingMore) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) void loadMoreResults();
+      },
+      { rootMargin: "600px" },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [hasMoreResults, loadingMore, busy, images.length, activeQuery, folder]);
+
   async function chooseAndScan() {
     const selected = await open({ directory: true, multiple: false, title: "選擇照片資料夾" });
     if (!selected || Array.isArray(selected)) return;
     setBusy(true);
+    searchRequestRef.current += 1;
+    setActiveQuery("");
+    setHasMoreResults(false);
+    setTotalResults(0);
     setScanProgress({ processed: 0, total: 0, eta_seconds: null, indexed: 0, reused: 0, skipped: 0, ocr_available: false, semantic_available: false, face_available: false, faces_detected: 0, clip_gpu_active: false, face_gpu_active: false, thumbnail_gpu_requested: settingsInfo?.settings.thumbnail_gpu ?? false, thumbnail_gpu_active: false, ocr_gpu_requested: settingsInfo?.settings.ocr_gpu ?? false, ocr_gpu_active: false, gpu_warning: null });
     setStatus("正在產生縮圖、OCR、語意與人臉向量（首次使用可能下載模型）…");
     try {
       const result = await invoke<ScanResult>("scan_folder", { folder: selected });
       setFolder(result.root);
       setQuery("");
-      const [indexed, groups] = await Promise.all([
-        invoke<ImageRecord[]>("search_images", { query: "" }),
+      setActiveQuery("");
+      const [page, groups] = await Promise.all([
+        invoke<SearchPage>("search_images_page", { query: "", offset: 0, limit: RESULT_PAGE_SIZE }),
         invoke<FaceGroup[]>("list_face_groups")
       ]);
-      setImages(indexed);
+      applySearchPage(page, false);
       setFaceGroups(groups);
       setFaceNames(Object.fromEntries(groups.map((group) => [group.id, group.name ?? ""])));
       const gpuWarning = result.gpu_warning ? `；⚠ ${result.gpu_warning}` : "";
-      setStatus(`已索引 ${result.indexed} 張圖片${result.reused ? `（重用 ${result.reused} 筆 SQLite 快取）` : ""}，先載入最多 200 張預覽；縮圖${result.thumbnail_gpu_requested ? `（${result.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : "使用一般處理流程"}；${result.ocr_available ? `OCR 已啟用${result.ocr_gpu_requested ? `（${result.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "找不到 Tesseract，僅使用檔名搜尋"}；${result.semantic_available ? `Semantic Search 已啟用${result.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒，僅使用文字搜尋"}；${result.face_available ? `偵測到 ${result.faces_detected} 張臉、${result.face_groups} 個人物群組${result.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}${result.skipped ? `；略過 ${result.skipped} 個無法讀取的檔案` : ""}${gpuWarning}。`);
+      setStatus(`已索引 ${result.indexed} 張圖片${result.reused ? `（重用 ${result.reused} 筆 SQLite 快取）` : ""}，先載入 ${RESULT_PAGE_SIZE} 張預覽並可繼續捲動；縮圖${result.thumbnail_gpu_requested ? `（${result.thumbnail_gpu_active ? "GPU" : "CPU，GPU 不可用"}）` : "使用一般處理流程"}；${result.ocr_available ? `OCR 已啟用${result.ocr_gpu_requested ? `（${result.ocr_gpu_active ? "OpenCL GPU" : "CPU，OpenCL 不可用"}）` : ""}` : "找不到 Tesseract，僅使用檔名搜尋"}；${result.semantic_available ? `Semantic Search 已啟用${result.clip_gpu_active ? "（GPU）" : "（CPU）"}` : "語意模型未就緒，僅使用文字搜尋"}；${result.face_available ? `偵測到 ${result.faces_detected} 張臉、${result.face_groups} 個人物群組${result.face_gpu_active ? "（GPU）" : "（CPU）"}` : "人臉模型未就緒"}${result.skipped ? `；略過 ${result.skipped} 個無法讀取的檔案` : ""}${gpuWarning}。`);
     } catch (error) {
       setStatus(`建立索引失敗：${String(error)}`);
     } finally {
@@ -146,8 +199,14 @@ function App() {
       const groups = await invoke<FaceGroup[]>("label_face_group", { groupId: group.id, name });
       setFaceGroups(groups);
       setFaceNames(Object.fromEntries(groups.map((item) => [item.id, item.name ?? ""])));
-      const refreshed = await invoke<ImageRecord[]>("search_images", { query });
-      setImages(refreshed);
+      searchRequestRef.current += 1;
+      setActiveQuery(query);
+      const refreshed = await invoke<SearchPage>("search_images_page", {
+        query,
+        offset: 0,
+        limit: RESULT_PAGE_SIZE,
+      });
+      applySearchPage(refreshed, false);
       setStatus(name ? `已將這組人臉標記為「${name}」，現在可以用姓名搜尋。` : "已清除此人物群組的姓名標記。");
     } catch (error) {
       setStatus(`儲存人物姓名失敗：${String(error)}`);
@@ -162,20 +221,32 @@ function App() {
   }
 
   async function search(nextQuery = query) {
+    const requestId = ++searchRequestRef.current;
     setBusy(true);
+    setLoadingMore(false);
+    setActiveQuery(nextQuery);
+    setHasMoreResults(false);
+    setTotalResults(0);
     setStatus(nextQuery.trim() ? "正在載入語意模型並搜尋…" : "正在載入已索引圖片…");
     try {
-      const result = await invoke<ImageRecord[]>("search_images", { query: nextQuery });
-      setImages(result);
+      const result = await invoke<SearchPage>("search_images_page", {
+        query: nextQuery,
+        offset: 0,
+        limit: RESULT_PAGE_SIZE,
+      });
+      if (requestId !== searchRequestRef.current) return;
+      applySearchPage(result, false);
       setStatus(nextQuery.trim()
-        ? result.length > 0
-          ? `顯示 ${result.length} 張高相關圖片（最多 60 張）。`
+        ? result.total > 0
+          ? `顯示 ${result.images.length} / ${result.total} 張高相關圖片${result.has_more ? "，向下捲動載入更多。" : "。"}`
           : "找不到高信心結果，請改用更具體的描述；目前語意模型以英文查詢較準確。"
-        : `顯示最多 200 張已索引圖片（目前 ${result.length} 張）。`);
+        : `顯示 ${result.images.length} / ${result.total} 張已索引圖片${result.has_more ? "，向下捲動載入更多。" : "。"}`);
     } catch (error) {
-      setStatus(`搜尋失敗：${String(error)}`);
+      if (requestId === searchRequestRef.current) {
+        setStatus(`搜尋失敗：${String(error)}`);
+      }
     } finally {
-      setBusy(false);
+      if (requestId === searchRequestRef.current) setBusy(false);
     }
   }
 
@@ -252,9 +323,9 @@ function App() {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="例如：海邊的狗、發票、和小明的合照"
-            disabled={!folder || busy}
+            disabled={!folder || busy || loadingMore}
           />
-          <button type="submit" disabled={!folder || busy}>搜尋</button>
+          <button type="submit" disabled={!folder || busy || loadingMore}>搜尋</button>
         </form>
         <div className="filters">
           <button className={!peopleOnly ? "chip active" : "chip"} onClick={() => setPeopleOnly(false)}>全部</button>
@@ -333,7 +404,7 @@ function App() {
                 onDoubleClick={() => void revealItemInDir(image.path).catch((error) => setStatus(`無法在系統檔案管理員顯示圖片：${String(error)}`))}
                 title="雙擊以在系統檔案管理員顯示"
               >
-                <img src={image.thumbnail} alt={image.filename} loading="lazy" />
+                <img src={image.thumbnail} alt={image.filename} loading="lazy" decoding="async" />
                 <div className="card-info">
                   <strong>{image.filename}</strong>
                   <span>{image.width && image.height ? `${image.width} × ${image.height}` : "圖片"}</span>
@@ -343,6 +414,13 @@ function App() {
                 </div>
               </article>
             ))}
+          </div>
+        )}
+        {hasMoreResults && (
+          <div className="load-more" ref={loadMoreRef}>
+            <button type="button" onClick={() => void loadMoreResults()} disabled={loadingMore || busy}>
+              {loadingMore ? "正在載入更多…" : `載入更多（已顯示 ${images.length} / ${totalResults}）`}
+            </button>
           </div>
         )}
       </section>

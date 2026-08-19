@@ -61,8 +61,8 @@ const DEFAULT_INDEX_BATCH_SIZE: usize = 50;
 const MAX_PENDING_THUMBNAILS: usize = 50;
 const MAX_PENDING_EMBEDDINGS: usize = 50;
 const MAX_STREAM_BATCH_SIZE: usize = 500;
-const MAX_BROWSE_RESULTS: usize = 200;
-const MAX_SEARCH_RESULTS: usize = 60;
+const DEFAULT_RESULT_PAGE_SIZE: usize = 60;
+const MAX_RESULT_PAGE_SIZE: usize = 200;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
 const SEMANTIC_BEST_MARGIN: f32 = 0.07;
 const FACE_MATCH_THRESHOLD: f32 = 0.45;
@@ -226,6 +226,19 @@ struct IndexData {
     face_groups: Vec<FaceCluster>,
 }
 
+#[derive(Clone, Copy)]
+struct SearchResultRef {
+    index: usize,
+    score: f32,
+}
+
+#[derive(Clone)]
+struct SearchSessionState {
+    root: Option<String>,
+    query: String,
+    results: Vec<SearchResultRef>,
+}
+
 #[derive(Clone, Default)]
 struct AppIndex {
     data: Arc<Mutex<IndexData>>,
@@ -234,6 +247,7 @@ struct AppIndex {
     settings_file: Arc<Mutex<Option<PathBuf>>>,
     cache_file: Arc<Mutex<Option<PathBuf>>>,
     root: Arc<Mutex<Option<String>>>,
+    search_session: Arc<Mutex<Option<SearchSessionState>>>,
     scan_control: Arc<ScanControl>,
 }
 
@@ -440,6 +454,21 @@ async fn search_images(
 }
 
 #[tauri::command]
+async fn search_images_page(
+    query: String,
+    offset: usize,
+    limit: usize,
+    index: State<'_, AppIndex>,
+) -> Result<SearchPage, String> {
+    let index = index.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        search_images_page_sync(query, index, offset, limit)
+    })
+    .await
+    .map_err(|error| format!("搜尋工作意外中止：{error}"))?
+}
+
+#[tauri::command]
 fn get_model_settings(index: State<'_, AppIndex>) -> SettingsInfo {
     SettingsInfo {
         settings: current_settings(index.inner()),
@@ -547,6 +576,9 @@ fn label_face_group(
     if let Some(path) = people_file(index.inner()) {
         save_known_people(&path, &known_people)?;
     }
+    if let Ok(mut session) = index.search_session.lock() {
+        *session = None;
+    }
     Ok(summaries)
 }
 
@@ -600,6 +632,8 @@ mod tests {
         assert_eq!(plan.face_presence, FacePresence::Forbidden);
         assert_eq!(plan.extensions, vec!["jpg"]);
         assert_eq!(plan.limit, Some(20));
+        let expanded = parse_query("海邊 最多 120 張", &[]);
+        assert_eq!(expanded.limit, Some(120));
         assert!(plan.semantic_query.is_empty());
 
         let negative = parse_query("不要狗", &[]);
@@ -887,6 +921,7 @@ pub fn run() {
             pause_scan,
             resume_scan,
             search_images,
+            search_images_page,
             get_model_settings,
             update_model_settings,
             list_face_groups,

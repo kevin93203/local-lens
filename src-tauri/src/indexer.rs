@@ -19,6 +19,9 @@ pub(super) fn build_index(
     if !root.is_dir() {
         return Err("選擇的位置不是資料夾。".into());
     }
+    if let Ok(mut session) = index.search_session.lock() {
+        *session = None;
+    }
 
     let settings = current_settings(&index);
     let cache_path = cache_file(&index);
@@ -408,6 +411,9 @@ pub(super) fn build_index(
         images: records,
         face_groups: face_clusters,
     };
+    if let Ok(mut session) = index.search_session.lock() {
+        *session = None;
+    }
     if let Ok(mut current_root) = index.root.lock() {
         *current_root = Some(folder.clone());
     }

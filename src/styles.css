@@ -80,6 +80,9 @@ form button { padding: 10px 16px; }
 .card-info span, .card-info small { color: #91a095; font-size: .72rem; }
 .card-info small { color: #c7f36b; }
 .card-info .ocr-text { color: #b8c4ba; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.load-more { display: flex; justify-content: center; margin: 24px 0 8px; }
+.load-more button { border: 1px solid #466b42; border-radius: 10px; color: #dce8db; background: #17211b; padding: 10px 16px; font-weight: 700; }
+.load-more button:disabled { opacity: .6; cursor: wait; }
 .empty { margin: 76px auto; text-align: center; color: #99a69b; max-width: 420px; }
 .empty div { color: #c7f36b; font-size: 3rem; }.empty h2 { color: #e6ece6; margin-bottom: 7px; }.empty p { margin: 0; line-height: 1.6; }
 footer { color: #66756a; font-size: .76rem; margin-top: 48px; text-align: center; }
