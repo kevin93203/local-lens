@@ -55,9 +55,9 @@ npm run tauri build
 
 ## SQLite 索引快取與增量掃描
 
-索引會寫入 app-data 的 `index.sqlite3`，保存圖片的路徑、檔案大小、修改時間、EXIF 拍攝時間、縮圖、OCR 結果、CLIP 向量與人臉群組資料。重新選擇同一資料夾時，程式會以檔案大小與修改時間判斷是否有變更：未變更的圖片直接重用 SQLite 快取，不會重新產生縮圖、執行 OCR 或模型推論；新增或變更的檔案才會重建索引。SQLite 會依設定的批次大小分批提交，介面進度與完成訊息會顯示重用的快取筆數。EXIF 會優先讀取 `DateTimeOriginal`，再依序回退到 `DateTimeDigitized` 與 `DateTime`；沒有 EXIF 的圖片會保留空值，之後日期查詢可回退到檔案修改時間。
+索引會寫入 app-data 的 `index.sqlite3`，保存圖片的路徑、檔案大小、修改時間、EXIF 拍攝時間、OCR 結果、CLIP 向量與人臉群組資料；縮圖 JPEG 另外存放在 `image_thumbnails` BLOB 表，不會放進每張圖片的 metadata `record_json`。重新選擇同一資料夾時，程式會以檔案大小與修改時間判斷是否有變更：未變更的圖片直接重用 SQLite 快取，不會重新產生縮圖、執行 OCR 或模型推論；新增或變更的檔案才會重建索引。SQLite 會依設定的批次大小分批提交，介面進度與完成訊息會顯示重用的快取筆數。EXIF 會優先讀取 `DateTimeOriginal`，再依序回退到 `DateTimeDigitized` 與 `DateTime`；沒有 EXIF 的圖片會保留空值，之後日期查詢可回退到檔案修改時間。
 
-SQLite 會同時保存快取資料與搜尋索引：`image_ocr_fts` 是 FTS5 虛擬表，查詢 OCR／檔名文字時直接使用 SQLite MATCH；`image_vectors` 是 sqlite-vec `vec0` 虛擬表，CLIP 語意搜尋與人臉分群候選會使用 cosine KNN。`vector_rows` 保存向量與圖片路徑／人臉群組的對應，避免把所有向量一次載入記憶體。索引更新仍依檔案指紋增量處理，並依設定的批次大小提交。
+SQLite 會同時保存快取資料與搜尋索引：`image_thumbnails` 以 BLOB 保存縮圖，只有回傳給畫面最多 200／60 張結果時才懶載入；`image_ocr_fts` 是 FTS5 虛擬表，查詢 OCR／檔名文字時直接使用 SQLite MATCH；`image_vectors` 是 sqlite-vec `vec0` 虛擬表，CLIP 語意搜尋與人臉分群候選會使用 cosine KNN。`vector_rows` 保存向量與圖片路徑／人臉群組的對應，避免把所有向量一次載入記憶體。索引更新仍依檔案指紋增量處理，並依設定的批次大小提交。舊版本若將縮圖放在 `record_json`，第一次重用該快取時會重新產生並移至 `image_thumbnails`。
 
 目前使用的 sqlite-vec crates.io 套件未包含選用的 DiskANN／rescore C 原始檔；專案根目錄的 `.cargo/config.toml` 會關閉這兩個非必要模組，保留本專案使用的核心 `vec0` cosine KNN 功能。
 

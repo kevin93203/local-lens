@@ -38,6 +38,10 @@ use face::{Face, FaceEngine};
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const DEFAULT_MAX_INDEXED_IMAGES: usize = 3_000;
 const DEFAULT_INDEX_BATCH_SIZE: usize = 50;
+// Keep only a bounded number of encoded thumbnails in records while a cache
+// batch is waiting to be committed. The normal SQLite batch size is the same,
+// but this separate cap also protects users who configure a very large batch.
+const MAX_PENDING_THUMBNAILS: usize = 50;
 const MAX_BROWSE_RESULTS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 60;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
@@ -118,7 +122,6 @@ struct CachedImageRecord {
     captured_at: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
-    thumbnail: String,
     ocr_text: String,
     people: Vec<String>,
     embedding: Option<Vec<f32>>,
@@ -133,7 +136,6 @@ impl CachedImageRecord {
             captured_at: record.captured_at.clone(),
             width: record.width,
             height: record.height,
-            thumbnail: record.thumbnail.clone(),
             ocr_text: record.ocr_text.clone(),
             people: record.people.clone(),
             embedding: record.embedding.clone(),
@@ -150,7 +152,9 @@ impl CachedImageRecord {
             captured_at: self.captured_at,
             width: self.width,
             height: self.height,
-            thumbnail: self.thumbnail,
+            // Thumbnails are loaded lazily from image_thumbnails for the small
+            // result set returned to the WebView.
+            thumbnail: String::new(),
             ocr_text: self.ocr_text,
             people: self.people,
             score: 1.0,
@@ -170,6 +174,7 @@ struct FileFingerprint {
 struct CachedImage {
     fingerprint: FileFingerprint,
     record: CachedImageRecord,
+    thumbnail_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +360,16 @@ fn make_thumbnail(path: &Path, _use_gpu: bool) -> Result<(String, u32, u32), Str
         width,
         height,
     ))
+}
+
+fn decode_thumbnail_data_url(value: &str) -> Option<Vec<u8>> {
+    value
+        .strip_prefix("data:image/jpeg;base64,")
+        .and_then(|encoded| BASE64.decode(encoded).ok())
+}
+
+fn thumbnail_data_url(bytes: &[u8]) -> String {
+    format!("data:image/jpeg;base64,{}", BASE64.encode(bytes))
 }
 
 fn clip_execution_providers(use_gpu: bool) -> Vec<fastembed::ExecutionProviderDispatch> {
@@ -548,6 +563,14 @@ fn open_index_cache(path: &Path) -> Result<Connection, String> {
                 record_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS image_cache_root ON image_cache(root);
+            -- Keep binary thumbnails outside record_json so cached metadata can
+            -- be loaded without retaining every thumbnail in memory.
+            CREATE TABLE IF NOT EXISTS image_thumbnails (
+                path TEXT PRIMARY KEY NOT NULL,
+                root TEXT NOT NULL,
+                jpeg BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS image_thumbnails_root ON image_thumbnails(root);
             CREATE VIRTUAL TABLE IF NOT EXISTS image_ocr_fts USING fts5(
                 path UNINDEXED,
                 root UNINDEXED,
@@ -671,7 +694,10 @@ fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, Cached
     let Some(path) = path else { return HashMap::new() };
     let Ok(connection) = open_index_cache(path) else { return HashMap::new() };
     let Ok(mut statement) = connection.prepare(
-        "SELECT path, bytes, modified_ns, record_json FROM image_cache WHERE root = ?1",
+        "SELECT c.path, c.bytes, c.modified_ns, c.record_json, \
+                EXISTS(SELECT 1 FROM image_thumbnails t \
+                       WHERE t.path = c.path AND t.root = c.root) \
+         FROM image_cache c WHERE c.root = ?1",
     ) else {
         return HashMap::new();
     };
@@ -681,12 +707,13 @@ fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, Cached
             row.get::<_, u64>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)? != 0,
         ))
     }) else {
         return HashMap::new();
     };
     rows.filter_map(Result::ok)
-        .filter_map(|(path, bytes, modified_ns, record_json)| {
+        .filter_map(|(path, bytes, modified_ns, record_json, thumbnail_available)| {
             Some((
                 path,
                 CachedImage {
@@ -694,7 +721,11 @@ fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, Cached
                         bytes,
                         modified_ns: modified_ns.parse().ok()?,
                     },
+                    // Older record_json values may still contain a thumbnail
+                    // field. Serde ignores that legacy field; the thumbnail is
+                    // migrated lazily below when the cache row is reused.
                     record: serde_json::from_str(&record_json).ok()?,
+                    thumbnail_available,
                 },
             ))
         })
@@ -790,6 +821,14 @@ fn append_index_cache(
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if let Some(jpeg) = decode_thumbnail_data_url(&record.thumbnail) {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO image_thumbnails(path, root, jpeg) VALUES (?1, ?2, ?3)",
+                    params![record.path, root, jpeg],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         if let Some(embedding) = &record.embedding {
             upsert_vector_entry(&transaction, "clip", root, &record.path, "", embedding)?;
         } else {
@@ -797,6 +836,65 @@ fn append_index_cache(
         }
     }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn append_index_cache_and_release(
+    path: Option<&Path>,
+    root: &str,
+    records: &mut [ImageRecord],
+    fingerprints: &HashMap<String, FileFingerprint>,
+) -> Result<(), String> {
+    append_index_cache(path, root, records, fingerprints)?;
+    if path.is_some() {
+        // The durable copy is now in image_thumbnails. Do not retain the
+        // Base64 data URL in the full in-memory index.
+        for record in records {
+            if fingerprints.contains_key(&record.path) {
+                record.thumbnail.clear();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_stale_thumbnails(path: Option<&Path>, root: &str) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let connection = open_index_cache(path)?;
+    connection
+        .execute(
+            "DELETE FROM image_thumbnails
+             WHERE root = ?1
+               AND path NOT IN (SELECT path FROM image_cache WHERE root = ?1)",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn hydrate_thumbnails(path: Option<&Path>, records: &mut [ImageRecord]) {
+    let Some(path) = path else { return };
+    if records.iter().all(|record| !record.thumbnail.is_empty()) {
+        return;
+    }
+    let Ok(connection) = open_index_cache(path) else { return };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT jpeg FROM image_thumbnails WHERE path = ?1",
+    ) else {
+        return;
+    };
+    for record in records {
+        if !record.thumbnail.is_empty() {
+            continue;
+        }
+        let bytes = statement
+            .query_row(params![record.path], |row| row.get::<_, Vec<u8>>(0))
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(bytes) = bytes {
+            record.thumbnail = thumbnail_data_url(&bytes);
+        }
+    }
 }
 
 fn save_index_cache_state(
@@ -1321,6 +1419,7 @@ fn build_index(
     let _ = reset_index_cache(cache_path.as_deref(), &folder);
     let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let mut cache_written = 0usize;
+    let mut pending_thumbnails = 0usize;
     let batch_size = settings.index_batch_size.max(1);
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
@@ -1397,18 +1496,32 @@ fn build_index(
         if let (Some(current), Some(cached)) = (fingerprints.get(&path_text), cached_images.get(&path_text)) {
             if current.bytes == cached.fingerprint.bytes && current.modified_ns == cached.fingerprint.modified_ns {
                 faces_detected += cached.record.face_group_ids.len();
-                records.push(cached.record.clone().into_record(path_text));
+                let mut record = cached.record.clone().into_record(path_text);
+                // Older installations stored the thumbnail inside record_json.
+                // Recreate it once and move it to the dedicated BLOB table;
+                // subsequent scans can reuse it without loading it into the
+                // full in-memory index.
+                if !cached.thumbnail_available {
+                    if let Ok((thumbnail, _, _)) = make_thumbnail(path, settings.thumbnail_gpu) {
+                        record.thumbnail = thumbnail;
+                        pending_thumbnails += 1;
+                    }
+                }
+                records.push(record);
                 reused += 1;
-                if records.len().saturating_sub(cache_written) >= batch_size {
-                    if append_index_cache(
+                if records.len().saturating_sub(cache_written) >= batch_size
+                    || pending_thumbnails >= MAX_PENDING_THUMBNAILS
+                {
+                    if append_index_cache_and_release(
                         cache_path.as_deref(),
                         &folder,
-                        &records[cache_written..],
+                        &mut records[cache_written..],
                         &fingerprints,
                     )
                     .is_ok()
                     {
                         cache_written = records.len();
+                        pending_thumbnails = 0;
                     }
                 }
                 let processed = position + 1;
@@ -1525,19 +1638,29 @@ fn build_index(
                     embedding,
                     face_group_ids,
                 });
+                if cache_path.is_some()
+                    && records
+                        .last()
+                        .is_some_and(|record| !record.thumbnail.is_empty())
+                {
+                    pending_thumbnails += 1;
+                }
             }
             Err(_) => skipped += 1,
         }
-        if records.len().saturating_sub(cache_written) >= batch_size {
-            if append_index_cache(
+        if records.len().saturating_sub(cache_written) >= batch_size
+            || pending_thumbnails >= MAX_PENDING_THUMBNAILS
+        {
+            if append_index_cache_and_release(
                 cache_path.as_deref(),
                 &folder,
-                &records[cache_written..],
+                &mut records[cache_written..],
                 &fingerprints,
             )
             .is_ok()
             {
                 cache_written = records.len();
+                pending_thumbnails = 0;
             }
         }
         let processed = position + 1;
@@ -1568,17 +1691,20 @@ fn build_index(
             .map_err(|error| error.to_string())?;
         }
     }
-    records.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
     refresh_face_cluster_counts(&mut face_clusters, &records);
     // A cache write failure must not discard the freshly built in-memory index.
-    let _ = append_index_cache(
+    // Keep the processing order until this final flush so cache_written still
+    // identifies the unwritten suffix; sort only after persistence completes.
+    let _ = append_index_cache_and_release(
         cache_path.as_deref(),
         &folder,
-        &records[cache_written..],
+        &mut records[cache_written..],
         &fingerprints,
     );
+    let _ = cleanup_stale_thumbnails(cache_path.as_deref(), &folder);
     let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let _ = save_index_cache_state(cache_path.as_deref(), &folder, &face_clusters);
+    records.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
     let indexed = records.len();
     let face_groups = face_clusters.len();
     *index.data.lock().map_err(|_| "索引暫時無法使用。")? = IndexData {
@@ -2131,8 +2257,11 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
     let settings = current_settings(&index);
     let data = index.data.lock().map_err(|_| "索引暫時無法使用。")?;
     let records = &data.images;
+    let cache_path = cache_file(&index);
     if query.trim().is_empty() {
-        return Ok(records.iter().take(MAX_BROWSE_RESULTS).cloned().collect());
+        let mut results: Vec<ImageRecord> = records.iter().take(MAX_BROWSE_RESULTS).cloned().collect();
+        hydrate_thumbnails(cache_path.as_deref(), &mut results);
+        return Ok(results);
     }
     let mut known_people: Vec<String> = records
         .iter()
@@ -2141,7 +2270,6 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
     known_people.sort_unstable();
     known_people.dedup();
     let plan = parse_query(&query, &known_people);
-    let cache_path = cache_file(&index);
     let fts_scores = fts5_search_scores(cache_path.as_deref(), &plan.text);
     let query_embeddings = if !plan.semantic_query.is_empty()
         && records.iter().any(|record| record.embedding.is_some())
@@ -2280,8 +2408,9 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
             .then_with(|| a.filename.cmp(&b.filename))
     });
     // Semantic search intentionally returns a compact high-confidence set.
-    // Thumbnails are data URLs, so this also keeps the IPC response small.
+    // Only this bounded result set receives Base64 thumbnail data URLs for IPC.
     matches.truncate(plan.limit.unwrap_or(MAX_SEARCH_RESULTS));
+    hydrate_thumbnails(cache_path.as_deref(), &mut matches);
     Ok(matches)
 }
 
@@ -2534,7 +2663,7 @@ mod tests {
             captured_at: Some("2025-07-01 12:34:56".to_owned()),
             width: Some(1200),
             height: Some(800),
-            thumbnail: "data:image/jpeg;base64,test".to_owned(),
+            thumbnail: "data:image/jpeg;base64,AA==".to_owned(),
             ocr_text: "receipt".to_owned(),
             people: vec!["Tony".to_owned()],
             score: 1.0,
@@ -2560,6 +2689,11 @@ mod tests {
         );
         assert_eq!(cached_record.record.ocr_text, "receipt");
         assert_eq!(cached_record.record.embedding, Some(vec![0.25, 0.75]));
+        assert!(cached_record.thumbnail_available);
+        assert!(cached_record.record.clone().into_record(path.clone()).thumbnail.is_empty());
+        let mut hydrated = vec![cached_record.record.clone().into_record(path.clone())];
+        hydrate_thumbnails(Some(&cache_path), &mut hydrated);
+        assert_eq!(hydrated[0].thumbnail, "data:image/jpeg;base64,AA==");
         let _ = fs::remove_file(cache_path);
     }
 
