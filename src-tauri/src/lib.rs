@@ -308,15 +308,23 @@ fn wait_for_scan_resume(control: &ScanControl) -> Result<(), String> {
     Ok(())
 }
 
-fn estimate_remaining_seconds(started_at: Instant, processed: usize, total: usize) -> Option<u64> {
-    if processed == 0 || total == 0 || processed >= total {
-        return (processed >= total && total > 0).then_some(0);
+fn estimate_remaining_seconds(
+    started_at: Instant,
+    processed_work: usize,
+    total_work: usize,
+) -> Option<u64> {
+    // Reused cache entries are intentionally excluded from this rate. They can
+    // be much faster than a newly indexed image and otherwise make the ETA
+    // appear unrealistically short before the expensive work starts.
+    if processed_work == 0 || total_work == 0 || processed_work >= total_work {
+        return (processed_work >= total_work && total_work > 0).then_some(0);
     }
     let elapsed = started_at.elapsed().as_secs_f64();
     if elapsed < 0.5 {
         return None;
     }
-    let seconds = ((total - processed) as f64 * elapsed / processed as f64).ceil();
+    let seconds =
+        ((total_work - processed_work) as f64 * elapsed / processed_work as f64).ceil();
     Some(seconds.max(0.0) as u64)
 }
 

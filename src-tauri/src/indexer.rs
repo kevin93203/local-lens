@@ -24,9 +24,10 @@ pub(super) fn build_index(
     let cache_path = cache_file(&index);
     // First pass: count and detect changes without retaining paths, metadata,
     // or cached records. A second WalkDir pass performs the actual indexing.
-    let (total, needs_processing) = {
+    let (total, total_to_process, needs_processing) = {
         let reader = open_cache_reader(cache_path.as_deref(), &folder);
         let mut total = 0usize;
+        let mut total_to_process = 0usize;
         let mut needs_processing = reader.is_none();
         for path in image_paths(&root, settings.max_indexed_images) {
             total += 1;
@@ -35,16 +36,25 @@ pub(super) fn build_index(
             let cached = reader
                 .as_ref()
                 .and_then(|reader| reader.lookup(&path_text));
-            if !matches!(
-                (fingerprint, cached),
+            let unchanged = matches!(
+                (fingerprint, cached.as_ref()),
                 (Some(current), Some(cached))
                     if current.bytes == cached.fingerprint.bytes
                         && current.modified_ns == cached.fingerprint.modified_ns
-            ) {
+            );
+            if !unchanged {
                 needs_processing = true;
+                total_to_process += 1;
+            } else if cached
+                .as_ref()
+                .is_some_and(|cached| !cached.thumbnail_available)
+            {
+                // Legacy records need one thumbnail migration even though the
+                // image metadata and embedding can still be reused.
+                total_to_process += 1;
             }
         }
-        (total, needs_processing)
+        (total, total_to_process, needs_processing)
     };
     let mut records = Vec::new();
     let mut reused = 0;
@@ -111,12 +121,14 @@ pub(super) fn build_index(
     let gpu_warning = (!gpu_warnings.is_empty()).then(|| gpu_warnings.join("；"));
     let face_available = face_engine.is_some() || !face_clusters.is_empty();
     let scan_started_at = Instant::now();
+    let mut processing_started_at = None;
+    let mut processed_to_process = 0usize;
     app.emit(
         "scan-progress",
         ScanProgress {
             processed: 0,
             total,
-            eta_seconds: estimate_remaining_seconds(scan_started_at, 0, total),
+            eta_seconds: estimate_remaining_seconds(scan_started_at, 0, total_to_process),
             indexed: 0,
             reused: 0,
             skipped: 0,
@@ -143,6 +155,7 @@ pub(super) fn build_index(
             .and_then(|reader| reader.lookup(&path_text));
         if let (Some(current), Some(cached)) = (fingerprint, cached) {
             if current.bytes == cached.fingerprint.bytes && current.modified_ns == cached.fingerprint.modified_ns {
+                let thumbnail_needs_processing = !cached.thumbnail_available;
                 faces_detected += cached.record.face_group_ids.len();
                 batch_fingerprints.insert(path_text.clone(), current);
                 let mut record = cached.record.clone().into_record(path_text);
@@ -150,7 +163,8 @@ pub(super) fn build_index(
                 // Recreate it once and move it to the dedicated BLOB table;
                 // subsequent scans can reuse it without loading it into the
                 // full in-memory index.
-                if !cached.thumbnail_available {
+                if thumbnail_needs_processing {
+                    processing_started_at.get_or_insert_with(Instant::now);
                     if let Ok((thumbnail, _, _)) = make_thumbnail(&path, settings.thumbnail_gpu) {
                         record.thumbnail = thumbnail;
                         pending_thumbnails += 1;
@@ -158,6 +172,9 @@ pub(super) fn build_index(
                 }
                 records.push(record);
                 reused += 1;
+                if thumbnail_needs_processing {
+                    processed_to_process += 1;
+                }
                 if records.len().saturating_sub(cache_written) >= batch_size
                     || pending_thumbnails >= MAX_PENDING_THUMBNAILS
                     || pending_clip_embeddings.len() >= MAX_PENDING_EMBEDDINGS
@@ -182,7 +199,13 @@ pub(super) fn build_index(
                         ScanProgress {
                             processed,
                             total,
-                            eta_seconds: estimate_remaining_seconds(scan_started_at, processed, total),
+                            eta_seconds: processing_started_at.and_then(|started_at| {
+                                estimate_remaining_seconds(
+                                    started_at,
+                                    processed_to_process,
+                                    total_to_process,
+                                )
+                            }),
                             indexed: records.len(),
                             reused,
                             skipped,
@@ -204,6 +227,7 @@ pub(super) fn build_index(
                 continue;
             }
         }
+        processing_started_at.get_or_insert_with(Instant::now);
         match make_thumbnail(&path, settings.thumbnail_gpu) {
             Ok((thumbnail, width, height)) => {
                 let embedding = if let Some(model) = image_model.as_mut() {
@@ -307,6 +331,7 @@ pub(super) fn build_index(
             }
             Err(_) => skipped += 1,
         }
+        processed_to_process += 1;
         if records.len().saturating_sub(cache_written) >= batch_size
             || pending_thumbnails >= MAX_PENDING_THUMBNAILS
             || pending_clip_embeddings.len() >= MAX_PENDING_EMBEDDINGS
@@ -332,7 +357,13 @@ pub(super) fn build_index(
                 ScanProgress {
                     processed,
                     total,
-                    eta_seconds: estimate_remaining_seconds(scan_started_at, processed, total),
+                    eta_seconds: processing_started_at.and_then(|started_at| {
+                        estimate_remaining_seconds(
+                            started_at,
+                            processed_to_process,
+                            total_to_process,
+                        )
+                    }),
                     indexed: records.len(),
                     reused,
                     skipped,
