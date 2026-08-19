@@ -1,0 +1,5 @@
+[env]
+# sqlite-vec 0.1.10-alpha.4 的 crates.io 套件未包含 DiskANN/rescore 的
+# C 原始檔。核心 vec0（本專案使用的 cosine KNN）不依賴這兩個模組，
+# 因此在 Windows 編譯時關閉它們，避免套件的遺漏檔案造成編譯失敗。
+CFLAGS = { value = "/DSQLITE_VEC_ENABLE_DISKANN=0 /DSQLITE_VEC_ENABLE_RESCORE=0", force = false }

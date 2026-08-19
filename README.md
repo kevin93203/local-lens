@@ -1,6 +1,6 @@
 # Local Lens
 
-一個以 Tauri 2、React 與 Rust 製作的 Windows 本機圖片搜尋 MVP。照片會在使用者選擇的資料夾中讀取，縮圖與暫存索引只保留在應用程式記憶體；人物姓名與代表向量保存在 app-data，所有資料都不會上傳。
+一個以 Tauri 2、React 與 Rust 製作的 Windows 本機圖片搜尋 MVP。照片會在使用者選擇的資料夾中讀取，索引快取與搜尋索引保存在 app-data 的 SQLite；人物姓名與代表向量也只保存在本機，所有資料都不會上傳。
 
 ## 已完成的 MVP
 
@@ -13,6 +13,7 @@
 - 在設定中分別控制 CLIP、Face 的 DirectML GPU 加速及 Tesseract OCR 的實驗性 OpenCL 請求
 - 格狀預覽、圖片尺寸與雙擊於檔案總管開啟原圖
 - 預留 `ocr_text`、`people`、`score` 欄位，讓 OCR、人臉辨識及語意搜尋共用同一個索引介面
+- 使用 SQLite FTS5 建立 OCR／檔名全文索引，使用 sqlite-vec `vec0` 建立 512 維 CLIP 與人臉向量索引
 - Tauri capability 僅開啟對話框與開啟檔案功能；掃描在 Rust 命令端執行
 
 ## 在 Windows 開發環境執行
@@ -56,11 +57,13 @@ npm run tauri build
 
 索引會寫入 app-data 的 `index.sqlite3`，保存圖片的路徑、檔案大小、修改時間、EXIF 拍攝時間、縮圖、OCR 結果、CLIP 向量與人臉群組資料。重新選擇同一資料夾時，程式會以檔案大小與修改時間判斷是否有變更：未變更的圖片直接重用 SQLite 快取，不會重新產生縮圖、執行 OCR 或模型推論；新增或變更的檔案才會重建索引。SQLite 會依設定的批次大小分批提交，介面進度與完成訊息會顯示重用的快取筆數。EXIF 會優先讀取 `DateTimeOriginal`，再依序回退到 `DateTimeDigitized` 與 `DateTime`；沒有 EXIF 的圖片會保留空值，之後日期查詢可回退到檔案修改時間。
 
-目前 SQLite 主要用於索引快取與載入既有人臉群組；後續可再加入 FTS5 OCR 索引、sqlite-vec 向量查詢，以及人臉群組拆分／合併的管理畫面。
+SQLite 會同時保存快取資料與搜尋索引：`image_ocr_fts` 是 FTS5 虛擬表，查詢 OCR／檔名文字時直接使用 SQLite MATCH；`image_vectors` 是 sqlite-vec `vec0` 虛擬表，CLIP 語意搜尋與人臉分群候選會使用 cosine KNN。`vector_rows` 保存向量與圖片路徑／人臉群組的對應，避免把所有向量一次載入記憶體。索引更新仍依檔案指紋增量處理，並依設定的批次大小提交。
+
+目前使用的 sqlite-vec crates.io 套件未包含選用的 DiskANN／rescore C 原始檔；專案根目錄的 `.cargo/config.toml` 會關閉這兩個非必要模組，保留本專案使用的核心 `vec0` cosine KNN 功能。
 
 ## 規則式 Query Parser
 
-搜尋輸入會先經過本機規則式 Parser，再交給目前的文字與 CLIP 搜尋流程。Parser 可辨識日期（例如「去年夏天」、「2024 年 7 月」）、已標記人物（例如「小明的照片」、「不要小明」）、人臉條件（「有人臉」、「沒有人的照片」）、圖片副檔名（例如 `jpg`）與結果數量（例如「最多 20 張」）；剩餘描述會交給語意搜尋。這一層不需要 LLM，完全離線，之後仍可在相同 QueryPlan 介面上加入可選的本機 LLM Parser。
+搜尋輸入會先經過本機規則式 Parser，再交給 FTS5 文字查詢與 sqlite-vec CLIP 搜尋流程。Parser 可辨識日期（例如「去年夏天」、「2024 年 7 月」）、已標記人物（例如「小明的照片」、「不要小明」）、人臉條件（「有人臉」、「沒有人的照片」）、圖片副檔名（例如 `jpg`）與結果數量（例如「最多 20 張」）；剩餘描述會交給語意搜尋。這一層不需要 LLM，完全離線，之後仍可在相同 QueryPlan 介面上加入可選的本機 LLM Parser。
 
 ## Semantic Search
 

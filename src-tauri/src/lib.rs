@@ -22,7 +22,13 @@ use exif::{In, Reader as ExifReader, Tag};
 #[cfg(windows)]
 use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
 use serde::{Deserialize, Serialize};
-use rusqlite::{params, Connection};
+use rusqlite::{
+    ffi::sqlite3_auto_extension,
+    params,
+    Connection,
+    OptionalExtension,
+    Transaction,
+};
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
@@ -37,6 +43,7 @@ const MAX_SEARCH_RESULTS: usize = 60;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
 const SEMANTIC_BEST_MARGIN: f32 = 0.07;
 const FACE_MATCH_THRESHOLD: f32 = 0.45;
+const VECTOR_DIMENSION: usize = 512;
 const FACE_MODEL_REPOSITORY: &str = "WePrompt/buffalo_sc";
 
 struct CachedTextModel {
@@ -48,6 +55,7 @@ struct CachedTextModel {
 // for every keystroke/search would make subsequent searches unnecessarily slow.
 static TEXT_MODEL: OnceLock<Mutex<Option<CachedTextModel>>> = OnceLock::new();
 static DIRECTML_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
+static SQLITE_VEC_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -509,7 +517,23 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+fn register_sqlite_vec() -> Result<(), String> {
+    SQLITE_VEC_STATUS
+        .get_or_init(|| {
+            let result = unsafe {
+                sqlite3_auto_extension(Some(std::mem::transmute(
+                    sqlite_vec::sqlite3_vec_init as *const (),
+                )))
+            };
+            (result == 0)
+                .then_some(())
+                .ok_or_else(|| format!("無法註冊 sqlite-vec SQLite 擴充功能（錯誤碼 {result}）。"))
+        })
+        .clone()
+}
+
 fn open_index_cache(path: &Path) -> Result<Connection, String> {
+    register_sqlite_vec()?;
     let connection = Connection::open(path).map_err(|error| format!("無法開啟 SQLite 索引快取：{error}"))?;
     connection
         .execute_batch(
@@ -524,6 +548,26 @@ fn open_index_cache(path: &Path) -> Result<Connection, String> {
                 record_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS image_cache_root ON image_cache(root);
+            CREATE VIRTUAL TABLE IF NOT EXISTS image_ocr_fts USING fts5(
+                path UNINDEXED,
+                root UNINDEXED,
+                filename,
+                ocr_text,
+                people,
+                tokenize = 'unicode61 remove_diacritics 0'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS image_vectors USING vec0(
+                embedding float[512] distance_metric=cosine
+            );
+            CREATE TABLE IF NOT EXISTS vector_rows (
+                vector_rowid INTEGER PRIMARY KEY NOT NULL,
+                kind TEXT NOT NULL,
+                root TEXT NOT NULL,
+                path TEXT NOT NULL DEFAULT '',
+                group_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(kind, root, path, group_id)
+            );
+            CREATE INDEX IF NOT EXISTS vector_rows_scope ON vector_rows(kind, root);
             CREATE TABLE IF NOT EXISTS scan_state (
                 root TEXT PRIMARY KEY NOT NULL,
                 face_groups_json TEXT NOT NULL
@@ -536,6 +580,91 @@ fn open_index_cache(path: &Path) -> Result<Connection, String> {
     // column simply produces an ignored duplicate-column error here.
     let _ = connection.execute("ALTER TABLE image_cache ADD COLUMN captured_at TEXT", []);
     Ok(connection)
+}
+
+fn embedding_blob(values: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    for value in values {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    blob
+}
+
+fn delete_vector_entry(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    root: &str,
+    path: &str,
+    group_id: &str,
+) -> Result<(), String> {
+    let rowid = transaction
+        .query_row(
+            "SELECT vector_rowid FROM vector_rows WHERE kind = ?1 AND root = ?2 AND path = ?3 AND group_id = ?4",
+            params![kind, root, path, group_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(rowid) = rowid {
+        transaction
+            .execute("DELETE FROM image_vectors WHERE rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM vector_rows WHERE vector_rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn upsert_vector_entry(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    root: &str,
+    path: &str,
+    group_id: &str,
+    embedding: &[f32],
+) -> Result<(), String> {
+    if embedding.len() != VECTOR_DIMENSION {
+        return delete_vector_entry(transaction, kind, root, path, group_id);
+    }
+    let existing_rowid = transaction
+        .query_row(
+            "SELECT vector_rowid FROM vector_rows WHERE kind = ?1 AND root = ?2 AND path = ?3 AND group_id = ?4",
+            params![kind, root, path, group_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(rowid) = existing_rowid {
+        transaction
+            .execute("DELETE FROM image_vectors WHERE rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM vector_rows WHERE vector_rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+    }
+    let blob = embedding_blob(embedding);
+    let rowid = if let Some(rowid) = existing_rowid {
+        transaction
+            .execute(
+                "INSERT INTO image_vectors(rowid, embedding) VALUES (?1, ?2)",
+                params![rowid, blob],
+            )
+            .map_err(|error| error.to_string())?;
+        rowid
+    } else {
+        transaction
+            .execute("INSERT INTO image_vectors(embedding) VALUES (?1)", params![blob])
+            .map_err(|error| error.to_string())?;
+        transaction.last_insert_rowid()
+    };
+    transaction
+        .execute(
+            "INSERT INTO vector_rows(vector_rowid, kind, root, path, group_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![rowid, kind, root, path, group_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, CachedImage> {
@@ -593,6 +722,25 @@ fn reset_index_cache(path: Option<&Path>, root: &str) -> Result<(), String> {
         .execute("DELETE FROM image_cache WHERE root = ?1", params![root])
         .map_err(|error| error.to_string())?;
     connection
+        .execute("DELETE FROM image_ocr_fts WHERE root = ?1", params![root])
+        .map_err(|error| error.to_string())?;
+    let vector_ids: Vec<i64> = connection
+        .prepare("SELECT vector_rowid FROM vector_rows WHERE root = ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![root], |row| row.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .map_err(|error| error.to_string())?;
+    for rowid in vector_ids {
+        connection
+            .execute("DELETE FROM image_vectors WHERE rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute("DELETE FROM vector_rows WHERE root = ?1", params![root])
+        .map_err(|error| error.to_string())?;
+    connection
         .execute("DELETE FROM scan_state WHERE root = ?1", params![root])
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -607,24 +755,45 @@ fn append_index_cache(
     let Some(path) = path else { return Ok(()) };
     let mut connection = open_index_cache(path)?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
-    {
-        let mut insert = transaction
-            .prepare("INSERT INTO image_cache(root, path, bytes, modified_ns, captured_at, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+    for record in records {
+        let Some(fingerprint) = fingerprints.get(&record.path) else { continue };
+        let payload = serde_json::to_string(&CachedImageRecord::from_record(record))
             .map_err(|error| error.to_string())?;
-        for record in records {
-            let Some(fingerprint) = fingerprints.get(&record.path) else { continue };
-            let payload = serde_json::to_string(&CachedImageRecord::from_record(record))
-                .map_err(|error| error.to_string())?;
-            insert
-                .execute(params![
+        transaction
+            .execute(
+                "DELETE FROM image_ocr_fts WHERE path = ?1",
+                params![record.path],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO image_ocr_fts(path, root, filename, ocr_text, people) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.path,
+                    root,
+                    record.filename,
+                    record.ocr_text,
+                    record.people.join(" ")
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO image_cache(root, path, bytes, modified_ns, captured_at, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
                     root,
                     record.path,
                     fingerprint.bytes,
                     fingerprint.modified_ns.to_string(),
                     record.captured_at.as_deref(),
                     payload
-                ])
-                .map_err(|error| error.to_string())?;
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(embedding) = &record.embedding {
+            upsert_vector_entry(&transaction, "clip", root, &record.path, "", embedding)?;
+        } else {
+            delete_vector_entry(&transaction, "clip", root, &record.path, "")?;
         }
     }
     transaction.commit().map_err(|error| error.to_string())
@@ -646,6 +815,80 @@ fn save_index_cache_state(
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn sync_face_vectors(
+    path: Option<&Path>,
+    root: &str,
+    face_clusters: &[FaceCluster],
+) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let mut connection = open_index_cache(path)?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let old_ids: Vec<i64> = transaction
+        .prepare("SELECT vector_rowid FROM vector_rows WHERE kind = 'face' AND root = ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![root], |row| row.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .map_err(|error| error.to_string())?;
+    for rowid in old_ids {
+        transaction
+            .execute("DELETE FROM image_vectors WHERE rowid = ?1", params![rowid])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM vector_rows WHERE kind = 'face' AND root = ?1",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    for cluster in face_clusters {
+        upsert_vector_entry(
+            &transaction,
+            "face",
+            root,
+            "",
+            &cluster.id,
+            &cluster.centroid,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn find_nearest_face_group(
+    path: Option<&Path>,
+    root: &str,
+    embedding: &[f32],
+) -> Result<Option<(String, f32)>, String> {
+    let Some(path) = path else { return Ok(None) };
+    if embedding.len() != VECTOR_DIMENSION {
+        return Ok(None);
+    }
+    let connection = open_index_cache(path)?;
+    let blob = embedding_blob(embedding);
+    let nearest = connection
+        .query_row(
+            "SELECT rowid, distance FROM image_vectors \
+             WHERE embedding MATCH ?1 AND k = 1 \
+             AND rowid IN (SELECT vector_rowid FROM vector_rows WHERE kind = 'face' AND root = ?2) \
+             ORDER BY distance LIMIT 1",
+            params![blob, root],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((rowid, distance)) = nearest else { return Ok(None) };
+    let group_id = connection
+        .query_row(
+            "SELECT group_id FROM vector_rows WHERE vector_rowid = ?1 AND kind = 'face' AND root = ?2",
+            params![rowid, root],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(group_id.map(|group_id| (group_id, (1.0 - distance) as f32)))
 }
 
 fn refresh_face_cluster_counts(face_clusters: &mut Vec<FaceCluster>, records: &[ImageRecord]) {
@@ -721,6 +964,24 @@ fn assign_face_cluster(
     preview: String,
     raw_embedding: &[f32],
 ) -> (String, Option<String>) {
+    assign_face_cluster_with_hint(
+        clusters,
+        known_people,
+        image_id,
+        preview,
+        raw_embedding,
+        None,
+    )
+}
+
+fn assign_face_cluster_with_hint(
+    clusters: &mut Vec<FaceCluster>,
+    known_people: &[KnownPerson],
+    image_id: &str,
+    preview: String,
+    raw_embedding: &[f32],
+    vector_hint: Option<(String, f32)>,
+) -> (String, Option<String>) {
     let embedding = normalize_embedding(raw_embedding);
     let known_match = known_people
         .iter()
@@ -733,15 +994,20 @@ fn assign_face_cluster(
     let target_index = if let Some((person, _)) = known_match {
         clusters.iter().position(|cluster| cluster.id == person.id)
     } else {
-        clusters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, cluster)| {
-                let score = cosine_similarity(&embedding, &cluster.centroid);
-                (score >= FACE_MATCH_THRESHOLD).then_some((index, score))
+        vector_hint
+            .filter(|(_, score)| *score >= FACE_MATCH_THRESHOLD)
+            .and_then(|(group_id, _)| clusters.iter().position(|cluster| cluster.id == group_id))
+            .or_else(|| {
+                clusters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, cluster)| {
+                        let score = cosine_similarity(&embedding, &cluster.centroid);
+                        (score >= FACE_MATCH_THRESHOLD).then_some((index, score))
+                    })
+                    .max_by(|left, right| left.1.total_cmp(&right.1))
+                    .map(|(index, _)| index)
             })
-            .max_by(|left, right| left.1.total_cmp(&right.1))
-            .map(|(index, _)| index)
     };
 
     let index = if let Some(index) = target_index {
@@ -1053,6 +1319,7 @@ fn build_index(
     let mut skipped = 0;
     let settings = current_settings(&index);
     let _ = reset_index_cache(cache_path.as_deref(), &folder);
+    let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let mut cache_written = 0usize;
     let batch_size = settings.index_batch_size.max(1);
     let ocr_program = tesseract_program();
@@ -1204,12 +1471,20 @@ fn build_index(
                             let Some(face_preview) = make_face_thumbnail(&source, &face) else {
                                 continue;
                             };
-                            let (group_id, person_name) = assign_face_cluster(
+                            let vector_hint = find_nearest_face_group(
+                                cache_path.as_deref(),
+                                &folder,
+                                &face.embedding,
+                            )
+                            .ok()
+                            .flatten();
+                            let (group_id, person_name) = assign_face_cluster_with_hint(
                                 &mut face_clusters,
                                 &known_people,
                                 &path_text,
                                 face_preview,
                                 &face.embedding,
+                                vector_hint,
                             );
                             faces_detected += 1;
                             if !face_group_ids.contains(&group_id) {
@@ -1302,6 +1577,7 @@ fn build_index(
         &records[cache_written..],
         &fingerprints,
     );
+    let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let _ = save_index_cache_state(cache_path.as_deref(), &folder, &face_clusters);
     let indexed = records.len();
     let face_groups = face_clusters.len();
@@ -1765,6 +2041,92 @@ fn record_matches_plan(record: &ImageRecord, plan: &QueryPlan) -> bool {
     true
 }
 
+fn fts5_search_scores(path: Option<&Path>, text: &TextQueryPlan) -> Option<HashMap<String, f32>> {
+    let path = path?;
+    let connection = open_index_cache(path).ok()?;
+    let mut scores = HashMap::new();
+    let terms = text.should.iter().chain(text.must.iter());
+    for term in terms {
+        let escaped = term.replace('"', "\"\"");
+        let match_query = format!("\"{escaped}\"");
+        let mut statement = connection
+            .prepare(
+                "SELECT path FROM image_ocr_fts \
+                 WHERE image_ocr_fts MATCH ?1",
+            )
+            .ok()?;
+        let rows = statement
+            .query_map(params![match_query], |row| row.get::<_, String>(0))
+            .ok()?;
+        for row in rows.flatten() {
+            *scores.entry(row).or_insert(0.0) += 1.0;
+        }
+    }
+    for term in &text.must_not {
+        let escaped = term.replace('"', "\"\"");
+        let match_query = format!("\"{escaped}\"");
+        let mut statement = connection
+            .prepare("SELECT path FROM image_ocr_fts WHERE image_ocr_fts MATCH ?1")
+            .ok()?;
+        let rows = statement
+            .query_map(params![match_query], |row| row.get::<_, String>(0))
+            .ok()?;
+        for row in rows.flatten() {
+            scores.remove(&row);
+        }
+    }
+    (!scores.is_empty()).then_some(scores)
+}
+
+fn sqlite_vec_search_scores(
+    path: Option<&Path>,
+    kind: &str,
+    embeddings: &[Vec<f32>],
+    limit: usize,
+) -> Option<HashMap<String, f32>> {
+    let path = path?;
+    let connection = open_index_cache(path).ok()?;
+    let mut scores = HashMap::new();
+    for embedding in embeddings {
+        if embedding.len() != VECTOR_DIMENSION {
+            continue;
+        }
+        let blob = embedding_blob(embedding);
+        let mut statement = connection
+            .prepare(
+                "SELECT rowid, distance FROM image_vectors \
+                 WHERE embedding MATCH ?1 AND k = ?2 \
+                 AND rowid IN (SELECT vector_rowid FROM vector_rows WHERE kind = ?3) \
+                 ORDER BY distance",
+            )
+            .ok()?;
+        let rows = statement
+            .query_map(params![blob, limit as i64, kind], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            })
+            .ok()?;
+        for row in rows.flatten() {
+            let (rowid, distance) = row;
+            let path_value = connection
+                .query_row(
+                    "SELECT path FROM vector_rows WHERE vector_rowid = ?1 AND kind = ?2",
+                    params![rowid, kind],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            let Some(path_value) = path_value.filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let score = (1.0 - distance).clamp(-1.0, 1.0) as f32;
+            scores
+                .entry(path_value)
+                .and_modify(|current: &mut f32| *current = current.max(score))
+                .or_insert(score);
+        }
+    }
+    (!scores.is_empty()).then_some(scores)
+}
+
 fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>, String> {
     let settings = current_settings(&index);
     let data = index.data.lock().map_err(|_| "索引暫時無法使用。")?;
@@ -1779,6 +2141,8 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
     known_people.sort_unstable();
     known_people.dedup();
     let plan = parse_query(&query, &known_people);
+    let cache_path = cache_file(&index);
+    let fts_scores = fts5_search_scores(cache_path.as_deref(), &plan.text);
     let query_embeddings = if !plan.semantic_query.is_empty()
         && records.iter().any(|record| record.embedding.is_some())
     {
@@ -1786,7 +2150,15 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
     } else {
         Vec::new()
     };
-    let semantic_search = !query_embeddings.is_empty();
+    let vector_scores = sqlite_vec_search_scores(
+        cache_path.as_deref(),
+        "clip",
+        &query_embeddings,
+        MAX_SEARCH_RESULTS.saturating_mul(5),
+    );
+    let semantic_search = vector_scores
+        .as_ref()
+        .map_or(!query_embeddings.is_empty(), |scores| !scores.is_empty());
     let has_positive_query = !plan.semantic_query.is_empty()
         || !plan.text.should.is_empty()
         || !plan.text.must.is_empty();
@@ -1813,8 +2185,9 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect();
-            let matched = plan.text.should
-                .iter()
+            let positive_terms = plan.text.should.iter().chain(plan.text.must.iter());
+            let matched = positive_terms
+                .clone()
                 .filter(|term| {
                     haystack.contains(term.as_str())
                         || compact_haystack.contains(
@@ -1834,16 +2207,32 @@ fn search_images_sync(query: String, index: AppIndex) -> Result<Vec<ImageRecord>
                             .collect::<String>(),
                     )
             });
-            let lexical_score = if plan.text.should.is_empty() || excluded {
+            let total_terms = plan.text.should.len() + plan.text.must.len();
+            let memory_lexical_score = if total_terms == 0 {
                 0.0
             } else {
-                matched as f32 / plan.text.should.len() as f32
+                matched as f32 / total_terms as f32
+            };
+            let lexical_score = if excluded {
+                0.0
+            } else if let Some(scores) = &fts_scores {
+                scores
+                    .get(&record.path)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(memory_lexical_score)
+            } else {
+                memory_lexical_score
             };
             let semantic_score = record.embedding.as_ref().and_then(|image_vector| {
-                query_embeddings
-                    .iter()
-                    .map(|query_vector| cosine_similarity(query_vector, image_vector))
-                    .max_by(f32::total_cmp)
+                if let Some(scores) = &vector_scores {
+                    scores.get(&record.path).copied()
+                } else {
+                    query_embeddings
+                        .iter()
+                        .map(|query_vector| cosine_similarity(query_vector, image_vector))
+                        .max_by(f32::total_cmp)
+                }
             });
             SearchCandidate {
                 record: record.clone(),
@@ -2171,6 +2560,62 @@ mod tests {
         );
         assert_eq!(cached_record.record.ocr_text, "receipt");
         assert_eq!(cached_record.record.embedding, Some(vec![0.25, 0.75]));
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn sqlite_fts5_and_vec_indexes_round_trip() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "local-lens-fts-vec-test-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = "C:\\Photos";
+        let path = "C:\\Photos\\receipt.jpg".to_owned();
+        let record = ImageRecord {
+            id: path.clone(),
+            path: path.clone(),
+            filename: "receipt.jpg".to_owned(),
+            modified_at: "2026-08-19".to_owned(),
+            captured_at: None,
+            width: Some(1200),
+            height: Some(800),
+            thumbnail: String::new(),
+            ocr_text: "receipt invoice".to_owned(),
+            people: vec!["Tony".to_owned()],
+            score: 1.0,
+            embedding: Some(vec![1.0; VECTOR_DIMENSION]),
+            face_group_ids: Vec::new(),
+        };
+        let fingerprints = HashMap::from([(
+            path.clone(),
+            FileFingerprint {
+                bytes: 42,
+                modified_ns: 123,
+            },
+        )]);
+
+        append_index_cache(Some(&cache_path), root, &[record], &fingerprints).unwrap();
+        let text = TextQueryPlan {
+            should: vec!["receipt".to_owned()],
+            must: Vec::new(),
+            must_not: Vec::new(),
+        };
+        let text_scores = fts5_search_scores(Some(&cache_path), &text).unwrap();
+        assert_eq!(text_scores.get(&path), Some(&1.0));
+
+        let vector_scores = sqlite_vec_search_scores(
+            Some(&cache_path),
+            "clip",
+            &[vec![1.0; VECTOR_DIMENSION]],
+            10,
+        )
+        .unwrap();
+        assert!(vector_scores.get(&path).is_some_and(|score| *score > 0.99));
+
         let _ = fs::remove_file(cache_path);
     }
 
