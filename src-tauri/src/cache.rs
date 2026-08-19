@@ -66,6 +66,11 @@ pub(super) fn open_index_cache(path: &Path) -> Result<Connection, String> {
             CREATE TABLE IF NOT EXISTS clip_vector_migrations (
                 root TEXT PRIMARY KEY NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS scan_seen (
+                root TEXT NOT NULL,
+                path TEXT NOT NULL,
+                PRIMARY KEY(root, path)
+            );
             ",
         )
         .map_err(|error| format!("無法初始化 SQLite 索引快取：{error}"))?;
@@ -237,47 +242,54 @@ fn migrate_legacy_clip_vectors(path: &Path, root: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn load_cached_images(path: Option<&Path>, root: &str) -> HashMap<String, CachedImage> {
-    let Some(path) = path else { return HashMap::new() };
-    let _ = migrate_legacy_clip_vectors(path, root);
-    let Ok(connection) = open_index_cache(path) else { return HashMap::new() };
-    let Ok(mut statement) = connection.prepare(
-        "SELECT c.path, c.bytes, c.modified_ns, c.record_json, \
-                EXISTS(SELECT 1 FROM image_thumbnails t \
-                       WHERE t.path = c.path AND t.root = c.root) \
-         FROM image_cache c WHERE c.root = ?1",
-    ) else {
-        return HashMap::new();
-    };
-    let Ok(rows) = statement.query_map(params![root], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)? != 0,
-        ))
-    }) else {
-        return HashMap::new();
-    };
-    rows.filter_map(Result::ok)
-        .filter_map(|(path, bytes, modified_ns, record_json, thumbnail_available)| {
-            Some((
-                path,
-                CachedImage {
-                    fingerprint: FileFingerprint {
-                        bytes,
-                        modified_ns: modified_ns.parse().ok()?,
-                    },
-                    // Older record_json values may still contain a thumbnail
-                    // field. Serde ignores that legacy field; the thumbnail is
-                    // migrated lazily below when the cache row is reused.
-                    record: serde_json::from_str(&record_json).ok()?,
-                    thumbnail_available,
+pub(super) struct CacheReader {
+    connection: Connection,
+    root: String,
+}
+
+impl CacheReader {
+    pub(super) fn lookup(&self, path: &str) -> Option<CachedImage> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT c.bytes, c.modified_ns, c.record_json, \
+                        EXISTS(SELECT 1 FROM image_thumbnails t \
+                               WHERE t.path = c.path AND t.root = c.root) \
+                 FROM image_cache c WHERE c.root = ?1 AND c.path = ?2",
+                params![self.root, path],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
                 },
-            ))
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        Some(CachedImage {
+            fingerprint: FileFingerprint {
+                bytes: row.0,
+                modified_ns: row.1.parse().ok()?,
+            },
+            // Older record_json values may still contain a thumbnail field.
+            // Serde ignores that legacy field; it is recreated lazily when
+            // the cache row is reused.
+            record: serde_json::from_str(&row.2).ok()?,
+            thumbnail_available: row.3,
         })
-        .collect()
+    }
+}
+
+pub(super) fn open_cache_reader(path: Option<&Path>, root: &str) -> Option<CacheReader> {
+    let path = path?;
+    let _ = migrate_legacy_clip_vectors(path, root);
+    Some(CacheReader {
+        connection: open_index_cache(path).ok()?,
+        root: root.to_owned(),
+    })
 }
 
 pub(super) fn load_cached_face_groups(path: Option<&Path>, root: &str) -> Vec<FaceCluster> {
@@ -294,18 +306,14 @@ pub(super) fn load_cached_face_groups(path: Option<&Path>, root: &str) -> Vec<Fa
         .unwrap_or_default()
 }
 
-pub(super) fn reset_index_cache(path: Option<&Path>, root: &str) -> Result<(), String> {
+pub(super) fn begin_scan_cache(path: Option<&Path>, root: &str) -> Result<(), String> {
     let Some(path) = path else { return Ok(()) };
     let connection = open_index_cache(path)?;
+    // Keep existing metadata, FTS rows and CLIP vectors available for lookup
+    // while this scan is running. scan_seen is the bounded reconciliation set.
     connection
-        .execute("DELETE FROM image_cache WHERE root = ?1", params![root])
+        .execute("DELETE FROM scan_seen WHERE root = ?1", params![root])
         .map_err(|error| error.to_string())?;
-    connection
-        .execute("DELETE FROM image_ocr_fts WHERE root = ?1", params![root])
-        .map_err(|error| error.to_string())?;
-    // Keep CLIP vectors for unchanged files. They are the source of truth for
-    // semantic search and are reconciled after the scan; deleting them here
-    // would force every reused image to load its vector into RAM again.
     connection
         .execute("DELETE FROM scan_state WHERE root = ?1", params![root])
         .map_err(|error| error.to_string())?;
@@ -357,6 +365,12 @@ pub(super) fn append_index_cache(
                 ],
             )
             .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO scan_seen(root, path) VALUES (?1, ?2)",
+                params![root, record.path],
+            )
+            .map_err(|error| error.to_string())?;
         if let Some(jpeg) = decode_thumbnail_data_url(&record.thumbnail) {
             transaction
                 .execute(
@@ -380,7 +394,7 @@ pub(super) fn append_index_cache_and_release(
     path: Option<&Path>,
     root: &str,
     records: &mut [ImageRecord],
-    fingerprints: &HashMap<String, FileFingerprint>,
+    fingerprints: &mut HashMap<String, FileFingerprint>,
     clip_embeddings: &mut HashMap<String, Option<Vec<f32>>>,
 ) -> Result<(), String> {
     append_index_cache(path, root, records, fingerprints, clip_embeddings)?;
@@ -392,9 +406,36 @@ pub(super) fn append_index_cache_and_release(
                 record.thumbnail.clear();
             }
         }
+        fingerprints.clear();
         clip_embeddings.clear();
     }
     Ok(())
+}
+
+pub(super) fn cleanup_stale_cache(path: Option<&Path>, root: &str) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let mut connection = open_index_cache(path)?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM image_ocr_fts
+             WHERE root = ?1
+               AND path NOT IN (SELECT path FROM scan_seen WHERE root = ?1)",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM image_cache
+             WHERE root = ?1
+               AND path NOT IN (SELECT path FROM scan_seen WHERE root = ?1)",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM scan_seen WHERE root = ?1", params![root])
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 pub(super) fn cleanup_stale_thumbnails(path: Option<&Path>, root: &str) -> Result<(), String> {

@@ -55,7 +55,7 @@ npm run tauri build
 
 ## SQLite 索引快取與增量掃描
 
-索引會寫入 app-data 的 `index.sqlite3`，保存圖片的路徑、檔案大小、修改時間、EXIF 拍攝時間、OCR 結果與人臉群組資料；CLIP 向量只存放在 `image_vectors`／`vector_rows`，不會放進記憶體中的 `ImageRecord` 或 metadata `record_json`。縮圖 JPEG 另外存放在 `image_thumbnails` BLOB 表，不會放進每張圖片的 metadata `record_json`。重新選擇同一資料夾時，程式會以檔案大小與修改時間判斷是否有變更：未變更的圖片直接重用 SQLite 快取，不會重新產生縮圖、執行 OCR 或模型推論；新增或變更的檔案才會重建索引。SQLite 會依設定的批次大小分批提交，介面進度與完成訊息會顯示重用的快取筆數。EXIF 會優先讀取 `DateTimeOriginal`，再依序回退到 `DateTimeDigitized` 與 `DateTime`；沒有 EXIF 的圖片會保留空值，之後日期查詢可回退到檔案修改時間。
+索引會寫入 app-data 的 `index.sqlite3`，保存圖片的路徑、檔案大小、修改時間、EXIF 拍攝時間、OCR 結果與人臉群組資料；CLIP 向量只存放在 `image_vectors`／`vector_rows`，不會放進記憶體中的 `ImageRecord` 或 metadata `record_json`。縮圖 JPEG 另外存放在 `image_thumbnails` BLOB 表，不會放進每張圖片的 metadata `record_json`。掃描會以兩次 streaming WalkDir 通過資料夾：第一次只統計數量與變更狀態，第二次逐張處理；快取資料逐路徑查詢，不會建立完整圖片路徑或快取 Vec。每批寫入後會釋放該批的縮圖、向量與指紋暫存。重新選擇同一資料夾時，程式會以檔案大小與修改時間判斷是否有變更：未變更的圖片直接重用 SQLite 快取，不會重新產生縮圖、執行 OCR 或模型推論；新增或變更的檔案才會重建索引。SQLite 會依設定的批次大小分批提交，介面進度與完成訊息會顯示重用的快取筆數。EXIF 會優先讀取 `DateTimeOriginal`，再依序回退到 `DateTimeDigitized` 與 `DateTime`；沒有 EXIF 的圖片會保留空值，之後日期查詢可回退到檔案修改時間。
 
 SQLite 會同時保存快取資料與搜尋索引：`image_thumbnails` 以 BLOB 保存縮圖，只有回傳給畫面最多 200／60 張結果時才懶載入；`image_ocr_fts` 是 FTS5 虛擬表，查詢 OCR／檔名文字時直接使用 SQLite MATCH；`image_vectors` 是 sqlite-vec `vec0` 虛擬表，CLIP 語意搜尋與人臉分群候選會使用 cosine KNN。`vector_rows` 保存向量與圖片路徑／人臉群組的對應，避免把所有向量一次載入記憶體。索引更新仍依檔案指紋增量處理，並依設定的批次大小提交。舊版本若將縮圖放在 `record_json`，第一次重用該快取時會重新產生並移至 `image_thumbnails`；舊版本若將 CLIP 向量放在 `record_json`，第一次載入時會以小批次搬移至 `image_vectors`，不會一次載入全部向量。
 

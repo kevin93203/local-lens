@@ -1,5 +1,15 @@
 use super::*;
 
+fn image_paths(root: &Path, limit: Option<usize>) -> impl Iterator<Item = PathBuf> + '_ {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file() && is_supported_image(path))
+        .take(limit.unwrap_or(usize::MAX))
+}
+
 pub(super) fn build_index(
     folder: String,
     app: tauri::AppHandle,
@@ -10,50 +20,51 @@ pub(super) fn build_index(
         return Err("選擇的位置不是資料夾。".into());
     }
 
-    let candidates: Vec<PathBuf> = WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|entry| entry.into_path())
-        .filter(|path| path.is_file() && is_supported_image(path))
-        .collect();
-    let candidates = if let Some(limit) = current_settings(&index).max_indexed_images {
-        candidates.into_iter().take(limit).collect()
-    } else {
-        candidates
-    };
-    let total = candidates.len();
+    let settings = current_settings(&index);
     let cache_path = cache_file(&index);
-    let cached_images = load_cached_images(cache_path.as_deref(), &folder);
-    let fingerprints: HashMap<String, FileFingerprint> = candidates
-        .iter()
-        .filter_map(|path| {
+    // First pass: count and detect changes without retaining paths, metadata,
+    // or cached records. A second WalkDir pass performs the actual indexing.
+    let (total, needs_processing) = {
+        let reader = open_cache_reader(cache_path.as_deref(), &folder);
+        let mut total = 0usize;
+        let mut needs_processing = reader.is_none();
+        for path in image_paths(&root, settings.max_indexed_images) {
+            total += 1;
             let path_text = path.to_string_lossy().into_owned();
-            file_fingerprint(path).map(|fingerprint| (path_text, fingerprint))
-        })
-        .collect();
-    let needs_processing = candidates.iter().any(|path| {
-        let path_text = path.to_string_lossy();
-        !matches!(
-            (fingerprints.get(path_text.as_ref()), cached_images.get(path_text.as_ref())),
-            (Some(current), Some(cached))
-                if current.bytes == cached.fingerprint.bytes
-                    && current.modified_ns == cached.fingerprint.modified_ns
-        )
-    });
+            let fingerprint = file_fingerprint(&path);
+            let cached = reader
+                .as_ref()
+                .and_then(|reader| reader.lookup(&path_text));
+            if !matches!(
+                (fingerprint, cached),
+                (Some(current), Some(cached))
+                    if current.bytes == cached.fingerprint.bytes
+                        && current.modified_ns == cached.fingerprint.modified_ns
+            ) {
+                needs_processing = true;
+            }
+        }
+        (total, needs_processing)
+    };
     let mut records = Vec::new();
     let mut reused = 0;
     let mut face_clusters = load_cached_face_groups(cache_path.as_deref(), &folder);
     let known_people = load_known_people(&index);
     let mut faces_detected = 0;
     let mut skipped = 0;
-    let settings = current_settings(&index);
-    let _ = reset_index_cache(cache_path.as_deref(), &folder);
+    let _ = begin_scan_cache(cache_path.as_deref(), &folder);
+    let cache_reader = open_cache_reader(cache_path.as_deref(), &folder);
     let _ = sync_face_vectors(cache_path.as_deref(), &folder, &face_clusters);
     let mut cache_written = 0usize;
+    let mut batch_fingerprints: HashMap<String, FileFingerprint> = HashMap::new();
     let mut pending_thumbnails = 0usize;
     let mut pending_clip_embeddings: HashMap<String, Option<Vec<f32>>> = HashMap::new();
-    let batch_size = settings.index_batch_size.max(1);
+    // Keep the streaming working set bounded even if the user enters a very
+    // large SQLite commit batch size.
+    let batch_size = settings
+        .index_batch_size
+        .max(1)
+        .min(MAX_STREAM_BATCH_SIZE);
     let ocr_program = tesseract_program();
     let ocr_available = has_tesseract(&ocr_program);
     let ocr_gpu_active = settings.ocr_gpu && ocr_available && tesseract_opencl_available(&ocr_program);
@@ -123,19 +134,24 @@ pub(super) fn build_index(
         },
     )
     .map_err(|error| error.to_string())?;
-    for (position, path) in candidates.iter().enumerate() {
+    for (position, path) in image_paths(&root, settings.max_indexed_images).enumerate() {
         wait_for_scan_resume(&index.scan_control)?;
         let path_text = path.to_string_lossy().into_owned();
-        if let (Some(current), Some(cached)) = (fingerprints.get(&path_text), cached_images.get(&path_text)) {
+        let fingerprint = file_fingerprint(&path);
+        let cached = cache_reader
+            .as_ref()
+            .and_then(|reader| reader.lookup(&path_text));
+        if let (Some(current), Some(cached)) = (fingerprint, cached) {
             if current.bytes == cached.fingerprint.bytes && current.modified_ns == cached.fingerprint.modified_ns {
                 faces_detected += cached.record.face_group_ids.len();
+                batch_fingerprints.insert(path_text.clone(), current);
                 let mut record = cached.record.clone().into_record(path_text);
                 // Older installations stored the thumbnail inside record_json.
                 // Recreate it once and move it to the dedicated BLOB table;
                 // subsequent scans can reuse it without loading it into the
                 // full in-memory index.
                 if !cached.thumbnail_available {
-                    if let Ok((thumbnail, _, _)) = make_thumbnail(path, settings.thumbnail_gpu) {
+                    if let Ok((thumbnail, _, _)) = make_thumbnail(&path, settings.thumbnail_gpu) {
                         record.thumbnail = thumbnail;
                         pending_thumbnails += 1;
                     }
@@ -150,7 +166,7 @@ pub(super) fn build_index(
                         cache_path.as_deref(),
                         &folder,
                         &mut records[cache_written..],
-                        &fingerprints,
+                        &mut batch_fingerprints,
                         &mut pending_clip_embeddings,
                     )
                     .is_ok()
@@ -188,10 +204,10 @@ pub(super) fn build_index(
                 continue;
             }
         }
-        match make_thumbnail(path, settings.thumbnail_gpu) {
+        match make_thumbnail(&path, settings.thumbnail_gpu) {
             Ok((thumbnail, width, height)) => {
                 let embedding = if let Some(model) = image_model.as_mut() {
-                    match model.embed(vec![path], None) {
+                    match model.embed(vec![&path], None) {
                         Ok(mut embeddings) => embeddings.pop(),
                         Err(_) => {
                             // A single unreadable/unsupported image should not abort the
@@ -207,7 +223,7 @@ pub(super) fn build_index(
                 };
                 let mut face_group_ids = Vec::new();
                 let mut people = Vec::new();
-                if let (Some(engine), Ok(source)) = (face_engine.as_mut(), image::open(path)) {
+                if let (Some(engine), Ok(source)) = (face_engine.as_mut(), image::open(&path)) {
                     let rgb = source.to_rgb8();
                     if let Ok(faces) = engine.run(&rgb) {
                         for face in faces {
@@ -259,12 +275,12 @@ pub(super) fn build_index(
                         .and_then(|metadata| metadata.modified())
                         .map(format_modified)
                         .unwrap_or_default(),
-                    captured_at: extract_exif_capture_time(path),
+                    captured_at: extract_exif_capture_time(&path),
                     width: Some(width),
                     height: Some(height),
                     thumbnail,
                     ocr_text: if ocr_available {
-                        extract_ocr_text(path, &ocr_program, settings.ocr_gpu)
+                        extract_ocr_text(&path, &ocr_program, settings.ocr_gpu)
                     } else {
                         String::new()
                     },
@@ -273,6 +289,9 @@ pub(super) fn build_index(
                     face_group_ids,
                 });
                 if cache_path.is_some() {
+                    if let (Some(record), Some(fingerprint)) = (records.last(), fingerprint) {
+                        batch_fingerprints.insert(record.path.clone(), fingerprint);
+                    }
                     pending_clip_embeddings.insert(
                         records.last().map(|record| record.path.clone()).unwrap_or_default(),
                         embedding,
@@ -296,7 +315,7 @@ pub(super) fn build_index(
                 cache_path.as_deref(),
                 &folder,
                 &mut records[cache_written..],
-                &fingerprints,
+                &mut batch_fingerprints,
                 &mut pending_clip_embeddings,
             )
             .is_ok()
@@ -333,6 +352,7 @@ pub(super) fn build_index(
             .map_err(|error| error.to_string())?;
         }
     }
+    drop(cache_reader);
     refresh_face_cluster_counts(&mut face_clusters, &records);
     // A cache write failure must not discard the freshly built in-memory index.
     // Keep the processing order until this final flush so cache_written still
@@ -341,9 +361,10 @@ pub(super) fn build_index(
         cache_path.as_deref(),
         &folder,
         &mut records[cache_written..],
-        &fingerprints,
+        &mut batch_fingerprints,
         &mut pending_clip_embeddings,
     );
+    let _ = cleanup_stale_cache(cache_path.as_deref(), &folder);
     let _ = cleanup_stale_thumbnails(cache_path.as_deref(), &folder);
     let _ = cleanup_stale_clip_vectors(cache_path.as_deref(), &folder);
     semantic_available = has_clip_vectors(cache_path.as_deref(), Some(&folder));

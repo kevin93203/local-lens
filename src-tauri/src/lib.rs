@@ -60,6 +60,7 @@ const DEFAULT_INDEX_BATCH_SIZE: usize = 50;
 // but this separate cap also protects users who configure a very large batch.
 const MAX_PENDING_THUMBNAILS: usize = 50;
 const MAX_PENDING_EMBEDDINGS: usize = 50;
+const MAX_STREAM_BATCH_SIZE: usize = 500;
 const MAX_BROWSE_RESULTS: usize = 200;
 const MAX_SEARCH_RESULTS: usize = 60;
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.20;
@@ -679,7 +680,7 @@ mod tests {
                 modified_ns: 123,
             },
         )]);
-        reset_index_cache(Some(&cache_path), root).unwrap();
+        begin_scan_cache(Some(&cache_path), root).unwrap();
         append_index_cache(
             Some(&cache_path),
             root,
@@ -699,8 +700,10 @@ mod tests {
             .unwrap();
         assert!(!payload.contains("\"embedding\""));
         drop(connection);
-        let cached = load_cached_images(Some(&cache_path), root);
-        let cached_record = cached.get(&path).unwrap();
+        let cached_record = open_cache_reader(Some(&cache_path), root)
+            .unwrap()
+            .lookup(&path)
+            .unwrap();
         assert_eq!(cached_record.fingerprint.bytes, 42);
         assert_eq!(
             cached_record.record.captured_at.as_deref(),
@@ -749,8 +752,10 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let cached = load_cached_images(Some(&cache_path), root);
-        assert!(cached.contains_key(path));
+        let cached = open_cache_reader(Some(&cache_path), root)
+            .unwrap()
+            .lookup(path);
+        assert!(cached.is_some());
         assert!(has_clip_vectors(Some(&cache_path), Some(root)));
         let scores = sqlite_vec_search_scores(
             Some(&cache_path),
